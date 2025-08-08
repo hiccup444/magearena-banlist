@@ -1750,6 +1750,11 @@ private System.Collections.IEnumerator RecreateUIAfterDelay()
                 CreateNavigationButton(navigationObj, "< Previous", new Vector2(0, 0), new Vector2(0.35f, 1), () => {
                     bannedPlayersPageIndex--;
                     RefreshBannedPlayersUIOptimized();
+                    var scroll = bannedPlayersTab != null ? bannedPlayersTab.GetComponent<ScrollRect>() : null;
+                    if (scroll != null)
+                    {
+                        scroll.verticalNormalizedPosition = 1f;
+                    }
                 });
             }
 
@@ -1759,6 +1764,11 @@ private System.Collections.IEnumerator RecreateUIAfterDelay()
                 CreateNavigationButton(navigationObj, "Next >", new Vector2(0.65f, 0), new Vector2(1, 1), () => {
                     bannedPlayersPageIndex++;
                     RefreshBannedPlayersUIOptimized();
+                    var scroll = bannedPlayersTab != null ? bannedPlayersTab.GetComponent<ScrollRect>() : null;
+                    if (scroll != null)
+                    {
+                        scroll.verticalNormalizedPosition = 1f;
+                    }
                 });
             }
         }
