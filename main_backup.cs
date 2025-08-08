@@ -5,6 +5,7 @@ using HarmonyLib;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using UnityEngine;
 using UnityEngine.UI;
 using TMPro;
@@ -39,6 +40,7 @@ namespace PlayerBanMod
         private GameObject bannedPlayersTab;
         private Toggle autobanModdedRanksToggle;
         private Toggle autobanOffensiveNamesToggle;
+        private bool isFirstTimeOpeningBannedTab = true;
         private bool isHost = false;
         private bool isInLobby = false;
 
@@ -58,6 +60,20 @@ namespace PlayerBanMod
         private const int MAX_KICK_ATTEMPTS = 3;
         private const float KICK_RETRY_DELAY = 3f; // 3 seconds between retries
         private const float RECENTLY_KICKED_DURATION = 10f; // 10 seconds to track recently kicked players
+
+        // Batched saving
+        private bool needsSave = false;
+        private float lastSaveTime = 0f;
+        private const float SAVE_INTERVAL = 5f; // Save every 5 seconds if needed
+
+        // Virtualized UI for large ban lists
+        private const int MAX_VISIBLE_BANNED_ITEMS = 50; // Only show 50 at a time
+        private int bannedPlayersPageIndex = 0;
+        private string bannedPlayersSearchQuery = "";
+
+        // For parsing the config file
+        private const string FIELD_DELIMITER = "◊"; // Diamond symbol - very unlikely in Steam names
+        private const string ENTRY_DELIMITER = "※"; // Reference mark - very unlikely in Steam names
 
         // WizardRank enum for rank validation
         private enum WizardRank
@@ -127,7 +143,8 @@ namespace PlayerBanMod
                 offensiveNamesConfig.Value = "discord.gg,cheat";
             }
             
-            LoadBannedPlayers();
+            // Async loading for very large lists
+            StartCoroutine(LoadBannedPlayersAsync());
 
             // Apply Harmony patches
             harmony.PatchAll();
@@ -161,68 +178,177 @@ namespace PlayerBanMod
             banTimestamps.Clear();
             banReasons.Clear();
             string bannedData = bannedPlayersConfig.Value;
+            
             if (!string.IsNullOrEmpty(bannedData))
             {
-                string[] entries = bannedData.Split('|');
-                foreach (string entry in entries)
+                // Handle both old format (colon-separated) and new format (safe delimiters)
+                bool isOldFormat = bannedData.Contains("|") && !bannedData.Contains(ENTRY_DELIMITER);
+                
+                if (isOldFormat)
                 {
-                    if (!string.IsNullOrEmpty(entry))
+                    ModLogger.LogInfo("Loading banned players from old format and converting...");
+                    LoadOldFormat(bannedData);
+                    // Save in new format immediately
+                    needsSave = true;
+                }
+                else
+                {
+                    LoadNewFormat(bannedData);
+                }
+            }
+            
+            ModLogger.LogInfo($"Loaded {bannedPlayers.Count} banned players");
+            
+            // Debug: Log the first few entries to check parsing
+            int debugCount = 0;
+            foreach (var kvp in bannedPlayers)
+            {
+                if (debugCount < 3) // Only log first 3 for debugging
+                {
+                    string steamId = kvp.Key;
+                    string playerName = kvp.Value;
+                    string timestamp = banTimestamps.ContainsKey(steamId) ? banTimestamps[steamId].ToString() : "None";
+                    string reason = banReasons.ContainsKey(steamId) ? banReasons[steamId] : "None";
+                    ModLogger.LogInfo($"Debug - Loaded ban: {playerName} ({steamId}) at {timestamp}, reason: {reason}");
+                    debugCount++;
+                }
+            }
+        }
+
+        // method for loading old format (backwards compatibility)
+        private void LoadOldFormat(string bannedData)
+        {
+            string[] entries = bannedData.Split('|');
+            foreach (string entry in entries)
+            {
+                if (!string.IsNullOrEmpty(entry))
+                {
+                    // Use the improved colon parsing logic for backwards compatibility
+                    string[] parts = entry.Split(new char[] { ':' }, 4);
+                    if (parts.Length >= 2)
                     {
-                        string[] parts = entry.Split(':');
-                        if (parts.Length >= 2)
+                        string steamId = parts[0].Trim();
+                        string playerName = parts[1].Trim();
+                        bannedPlayers[steamId] = playerName;
+                        
+                        if (parts.Length >= 3)
                         {
-                            string steamId = parts[0].Trim();
-                            string playerName = parts[1].Trim();
-                            bannedPlayers[steamId] = playerName;
+                            string timestampPart = parts[2].Trim();
                             
-                            // Load timestamp if available (new format)
-                            if (parts.Length >= 3)
+                            if (parts.Length >= 4)
                             {
-                                if (DateTime.TryParse(parts[2].Trim(), out DateTime timestamp))
+                                // 4 parts: steamId:playerName:timestamp:reason
+                                if (DateTime.TryParse(timestampPart, out DateTime timestamp))
                                 {
                                     banTimestamps[steamId] = timestamp;
                                 }
                                 else
                                 {
-                                    // If timestamp parsing fails, use current time as fallback
                                     banTimestamps[steamId] = DateTime.Now;
                                 }
-                            }
-                            else
-                            {
-                                // Legacy format - no timestamp, use current time
-                                banTimestamps[steamId] = DateTime.Now;
-                            }
-
-                            // Load ban reason if available (newest format)
-                            if (parts.Length >= 4)
-                            {
                                 banReasons[steamId] = parts[3].Trim();
                             }
                             else
                             {
-                                // Legacy format - no ban reason, default to "Manual"
-                                banReasons[steamId] = "Manual";
+                                // 3 parts: could be steamId:playerName:timestamp or steamId:playerName:reason
+                                if (DateTime.TryParse(timestampPart, out DateTime timestamp))
+                                {
+                                    banTimestamps[steamId] = timestamp;
+                                    banReasons[steamId] = "Manual";
+                                }
+                                else
+                                {
+                                    banTimestamps[steamId] = DateTime.Now;
+                                    banReasons[steamId] = timestampPart;
+                                }
                             }
+                        }
+                        else
+                        {
+                            // 2 parts: steamId:playerName
+                            banTimestamps[steamId] = DateTime.Now;
+                            banReasons[steamId] = "Manual";
                         }
                     }
                 }
             }
-            ModLogger.LogInfo($"Loaded {bannedPlayers.Count} banned players");
         }
 
-        private void SaveBannedPlayers()
+        // method for loading new format with safe delimiters
+        private void LoadNewFormat(string bannedData)
         {
-            var entries = bannedPlayers.Select(kvp => 
+            string[] entries = bannedData.Split(new string[] { ENTRY_DELIMITER }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (string entry in entries)
             {
-                string steamId = kvp.Key;
-                string playerName = kvp.Value;
-                string timestamp = banTimestamps.ContainsKey(steamId) ? banTimestamps[steamId].ToString("yyyy-MM-dd HH:mm:ss") : DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-                string reason = banReasons.ContainsKey(steamId) ? banReasons[steamId] : "Manual";
-                return $"{steamId}:{playerName}:{timestamp}:{reason}";
-            });
-            bannedPlayersConfig.Value = string.Join("|", entries);
-            ModLogger.LogInfo($"Saved {bannedPlayers.Count} banned players");
+                if (!string.IsNullOrEmpty(entry))
+                {
+                    string[] parts = entry.Split(new string[] { FIELD_DELIMITER }, StringSplitOptions.None);
+                    if (parts.Length >= 2)
+                    {
+                        string steamId = parts[0].Trim();
+                        string playerName = parts[1].Trim();
+                        bannedPlayers[steamId] = playerName;
+                        
+                        // Load timestamp if available
+                        if (parts.Length >= 3)
+                        {
+                            if (DateTime.TryParse(parts[2].Trim(), out DateTime timestamp))
+                            {
+                                banTimestamps[steamId] = timestamp;
+                            }
+                            else
+                            {
+                                banTimestamps[steamId] = DateTime.Now;
+                            }
+                        }
+                        else
+                        {
+                            banTimestamps[steamId] = DateTime.Now;
+                        }
+
+                        // Load ban reason if available
+                        if (parts.Length >= 4)
+                        {
+                            banReasons[steamId] = parts[3].Trim();
+                        }
+                        else
+                        {
+                            banReasons[steamId] = "Manual";
+                        }
+                    }
+                }
+            }
+        }
+
+        private void SaveBannedPlayersOptimized()
+        {
+            try
+            {
+                var sb = new StringBuilder(bannedPlayers.Count * 100);
+                bool first = true;
+                foreach (var kvp in bannedPlayers)
+                {
+                    if (!first) sb.Append(ENTRY_DELIMITER);
+                    first = false;
+
+                    string steamId = kvp.Key;
+                    string playerName = kvp.Value;
+                    string timestamp = banTimestamps.ContainsKey(steamId)
+                        ? banTimestamps[steamId].ToString("yyyy-MM-dd HH:mm:ss")
+                        : DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                    string reason = banReasons.ContainsKey(steamId) ? banReasons[steamId] : "Manual";
+
+                    // Use safe delimiters instead of colons
+                    sb.Append(steamId).Append(FIELD_DELIMITER).Append(playerName).Append(FIELD_DELIMITER).Append(timestamp).Append(FIELD_DELIMITER).Append(reason);
+                }
+
+                bannedPlayersConfig.Value = sb.ToString();
+                ModLogger.LogInfo($"Saved {bannedPlayers.Count} banned players with safe delimiters");
+            }
+            catch (Exception e)
+            {
+                ModLogger.LogError($"Error saving banned players: {e.Message}");
+            }
         }
 
         private System.Collections.IEnumerator MonitorLobbyStatus()
@@ -502,11 +628,15 @@ namespace PlayerBanMod
                         KickPlayerWithRetry(steamId, playerName, true);
                     }
                     
-                    SaveBannedPlayers();
-                    
-                    // Refresh both UI tabs to show the updated lists
-                    RefreshPlayerListUI();
-                    RefreshBannedPlayersUI();
+                    // Mark for batched saving instead of immediate save
+                    needsSave = true;
+
+                    // Only refresh UI if it's currently visible
+                    if (banUI != null && banUI.activeSelf)
+                    {
+                        RefreshPlayerListUI();
+                        RefreshBannedPlayersUI();
+                    }
                 }
             }
             catch (Exception e)
@@ -520,34 +650,33 @@ namespace PlayerBanMod
             // Check for F2 key press to open/close the UI
             if (Input.GetKeyDown(KeyCode.F2))
             {
-                // Allow UI when host and in lobby (both lobby screen and in-game)
-                if (isHost && isInLobby)  // REMOVED !IsGameActive() restriction
+                if (isHost && isInLobby)
                 {
                     if (banUI != null)
                     {
                         bool newState = !banUI.activeSelf;
                         banUI.SetActive(newState);
                         
-                        // Handle cursor state based on game state and UI state
+                        // Handle cursor state...
                         if (IsGameActive())
                         {
                             if (newState)
                             {
-                                // Opening UI during game - enable cursor
                                 Cursor.lockState = CursorLockMode.Confined;
                                 Cursor.visible = true;
                             }
                             else
                             {
-                                // Closing UI during game - disable cursor
                                 Cursor.lockState = CursorLockMode.Locked;
                                 Cursor.visible = false;
                             }
                         }
-                        // No cursor changes needed when in lobby - game handles it
                         
                         if (newState)
                         {
+                            // Reset the flag when opening UI so banned tab scrolls to top when first viewed
+                            isFirstTimeOpeningBannedTab = true;
+                            
                             // Refresh the UI when opening
                             RefreshPlayerListUI();
                             RefreshBannedPlayersUI();
@@ -587,6 +716,20 @@ namespace PlayerBanMod
                 {
                     ClearFakePlayersForTesting();
                 }
+
+                // F5 to generate test bans for pagination testing
+                if (Input.GetKeyDown(KeyCode.F5))
+                {
+                    GenerateTestBansForPagination();
+                }
+            }
+
+            // Batched saving - only save periodically
+            if (needsSave && Time.time - lastSaveTime > SAVE_INTERVAL)
+            {
+                SaveBannedPlayersOptimized();
+                needsSave = false;
+                lastSaveTime = Time.time;
             }
         }
 
@@ -1267,12 +1410,15 @@ private System.Collections.IEnumerator RecreateUIAfterDelay()
                 });
                 
                 bannedTabButton.onClick.AddListener(() => {
-                    activePlayersTab.SetActive(false);
-                    bannedPlayersTab.SetActive(true);
-                    activeTabButtonImage.color = new Color(0.3f, 0.3f, 0.3f, 0.9f); // Dim inactive tab
-                    bannedTabButtonImage.color = new Color(0.4f, 0.4f, 0.4f, 0.9f); // Highlight active tab
-                    RefreshBannedPlayersUI();
-                });
+                activePlayersTab.SetActive(false);
+                bannedPlayersTab.SetActive(true);
+                activeTabButtonImage.color = new Color(0.3f, 0.3f, 0.3f, 0.9f); // Dim inactive tab
+                bannedTabButtonImage.color = new Color(0.4f, 0.4f, 0.4f, 0.9f); // Highlight active tab
+                
+                // Reset scroll flag when switching to banned tab
+                isFirstTimeOpeningBannedTab = true;
+                RefreshBannedPlayersUI();
+            });
 
                 // Set initial tab state
                 activeTabButtonImage.color = new Color(0.4f, 0.4f, 0.4f, 0.9f); // Highlight active tab
@@ -1465,186 +1611,366 @@ private System.Collections.IEnumerator RecreateUIAfterDelay()
             }
         }
 
-         private void RefreshBannedPlayersUI()
-         {
-             try
-             {
-                 // Clear existing banned player entries
-                 foreach (Transform child in bannedPlayersContent)
-                 {
-                     Destroy(child.gameObject);
-                 }
-
-                 if (bannedPlayers.Count == 0)
-                 {
-                     // Create "no banned players" message
-                     var noBannedObj = new GameObject("NoBannedPlayers");
-                     noBannedObj.transform.SetParent(bannedPlayersContent, false);
-                     var noBannedText = noBannedObj.AddComponent<Text>();
-                     noBannedText.text = "No banned players";
-                     noBannedText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
-                     noBannedText.fontSize = 16;
-                     noBannedText.color = Color.gray;
-                     noBannedText.alignment = TextAnchor.MiddleCenter;
-                     
-                     var noBannedRect = noBannedObj.GetComponent<RectTransform>();
-                     noBannedRect.anchorMin = new Vector2(0, 1);
-                     noBannedRect.anchorMax = new Vector2(1, 1);
-                     noBannedRect.pivot = new Vector2(0.5f, 1);
-                     noBannedRect.offsetMin = new Vector2(10, -40);
-                     noBannedRect.offsetMax = new Vector2(-10, -10);
-                     
-                                           // Update content height
-                      var bannedPlayersContentRect1 = bannedPlayersContent.GetComponent<RectTransform>();
-                      bannedPlayersContentRect1.sizeDelta = new Vector2(0, 50);
-                     return;
-                 }
-
-                 int index = 0;
-                 foreach (var kvp in bannedPlayers)
-                 {
-                     string steamId = kvp.Key;
-                     string playerName = kvp.Value;
-                     DateTime banTime = banTimestamps.ContainsKey(steamId) ? banTimestamps[steamId] : DateTime.Now;
-                     string banTimeString = banTime.ToString("MM/dd/yyyy HH:mm");
-
-                     // Create banned player entry container
-                     var bannedEntryObj = new GameObject($"BannedEntry_{index}");
-                     bannedEntryObj.transform.SetParent(bannedPlayersContent, false);
-                     var bannedEntryImage = bannedEntryObj.AddComponent<Image>();
-                     bannedEntryImage.color = new Color(0.8f, 0.3f, 0.3f, 0.8f);
-                     
-                     var bannedEntryRect = bannedEntryObj.GetComponent<RectTransform>();
-                     bannedEntryRect.anchorMin = new Vector2(0, 1);
-                     bannedEntryRect.anchorMax = new Vector2(1, 1);
-                     bannedEntryRect.pivot = new Vector2(0.5f, 1);
-                     bannedEntryRect.offsetMin = new Vector2(5, -50 - (index * 60));
-                     bannedEntryRect.offsetMax = new Vector2(-5, -5 - (index * 60));
-
-                     // Create player name text
-                     var nameObj = new GameObject("PlayerName");
-                     nameObj.transform.SetParent(bannedEntryObj.transform, false);
-                     var nameText = nameObj.AddComponent<Text>();
-                     nameText.text = playerName;
-                     nameText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
-                     nameText.fontSize = 14;
-                     nameText.color = Color.white;
-                     nameText.alignment = TextAnchor.MiddleLeft;
-                     
-                     var nameRect = nameObj.GetComponent<RectTransform>();
-                     nameRect.anchorMin = new Vector2(0, 0);
-                     nameRect.anchorMax = new Vector2(0.25f, 1);
-                     nameRect.offsetMin = new Vector2(10, 5);
-                     nameRect.offsetMax = new Vector2(-5, -5);
-
-                     // Create Steam ID text
-                     var steamIdObj = new GameObject("SteamID");
-                     steamIdObj.transform.SetParent(bannedEntryObj.transform, false);
-                     var steamIdText = steamIdObj.AddComponent<Text>();
-                     steamIdText.text = steamId;
-                     steamIdText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
-                     steamIdText.fontSize = 14;
-                     steamIdText.color = Color.gray;
-                     steamIdText.alignment = TextAnchor.MiddleLeft;
-                     
-                     var steamIdRect = steamIdObj.GetComponent<RectTransform>();
-                     steamIdRect.anchorMin = new Vector2(0.25f, 0);
-                     steamIdRect.anchorMax = new Vector2(0.45f, 1);
-                     steamIdRect.offsetMin = new Vector2(5, 5);
-                     steamIdRect.offsetMax = new Vector2(-5, -5);
-
-                     // Create timestamp text
-                     var timestampObj = new GameObject("Timestamp");
-                     timestampObj.transform.SetParent(bannedEntryObj.transform, false);
-                     var timestampText = timestampObj.AddComponent<Text>();
-                     timestampText.text = banTimeString;
-                     timestampText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
-                     timestampText.fontSize = 14;
-                     timestampText.color = Color.yellow;
-                     timestampText.alignment = TextAnchor.MiddleLeft;
-                     
-                     var timestampRect = timestampObj.GetComponent<RectTransform>();
-                     timestampRect.anchorMin = new Vector2(0.45f, 0);
-                     timestampRect.anchorMax = new Vector2(0.65f, 1);
-                     timestampRect.offsetMin = new Vector2(5, 5);
-                     timestampRect.offsetMax = new Vector2(-5, -5);
-
-                     // Create ban reason text
-                     string banReason = banReasons.ContainsKey(steamId) ? banReasons[steamId] : "Manual";
-                     var banReasonObj = new GameObject("BanReason");
-                     banReasonObj.transform.SetParent(bannedEntryObj.transform, false);
-                     var banReasonText = banReasonObj.AddComponent<Text>();
-                     banReasonText.text = banReason;
-                     banReasonText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
-                     banReasonText.fontSize = 14;
-                     banReasonText.color = Color.cyan;
-                     banReasonText.alignment = TextAnchor.MiddleLeft;
-                     
-                     var banReasonRect = banReasonObj.GetComponent<RectTransform>();
-                     banReasonRect.anchorMin = new Vector2(0.65f, 0);
-                     banReasonRect.anchorMax = new Vector2(0.75f, 1);
-                     banReasonRect.offsetMin = new Vector2(5, 5);
-                     banReasonRect.offsetMax = new Vector2(-5, -5);
-
-                     // Create unban button
-                     var unbanButtonObj = new GameObject("UnbanButton");
-                     unbanButtonObj.transform.SetParent(bannedEntryObj.transform, false);
-                     var unbanButton = unbanButtonObj.AddComponent<Button>();
-                     var unbanButtonImage = unbanButtonObj.AddComponent<Image>();
-                     unbanButtonImage.color = new Color(0.2f, 0.6f, 0.2f);
-                     
-                     var unbanButtonTextObj = new GameObject("UnbanButtonText");
-                     unbanButtonTextObj.transform.SetParent(unbanButtonObj.transform, false);
-                     var unbanButtonText = unbanButtonTextObj.AddComponent<Text>();
-                     unbanButtonText.text = "Unban";
-                     unbanButtonText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
-                     unbanButtonText.fontSize = 12;
-                     unbanButtonText.color = Color.white;
-                     unbanButtonText.alignment = TextAnchor.MiddleCenter;
-                     
-                     var unbanButtonRect = unbanButtonObj.GetComponent<RectTransform>();
-                     unbanButtonRect.anchorMin = new Vector2(0.75f, 0.2f);
-                     unbanButtonRect.anchorMax = new Vector2(0.98f, 0.8f);
-                     unbanButtonRect.offsetMin = Vector2.zero;
-                     unbanButtonRect.offsetMax = Vector2.zero;
-                     
-                     unbanButton.onClick.AddListener(() => UnbanPlayer(steamId, playerName));
-
-                     index++;
-                 }
-
-                                   // Update content height
-                  var bannedPlayersContentRect2 = bannedPlayersContent.GetComponent<RectTransform>();
-                  var bannedScrollRect = bannedPlayersTab.GetComponent<ScrollRect>();
-                
-                // Calculate if we need scrolling (more than 11 players)
-                bool needsScrolling = index > 11;
-                
-                if (needsScrolling)
+        private void RefreshBannedPlayersUI()
+        {
+            RefreshBannedPlayersUIOptimized();
+            
+            // Only auto-scroll to top when UI is first opened, not on every refresh
+            if (isFirstTimeOpeningBannedTab && bannedPlayers.Count > 11)
+            {
+                var bannedScrollRect = bannedPlayersTab.GetComponent<ScrollRect>();
+                if (bannedScrollRect != null)
                 {
-                    // Normal scrolling behavior - set content height to accommodate all players
-                    bannedPlayersContentRect2.sizeDelta = new Vector2(0, index * 60 + 10);
-                    
-                    // Don't change scroll position when scrolling is needed
+                    // Set scroll to top
+                    bannedScrollRect.verticalNormalizedPosition = 1f;
                 }
-                else
+                isFirstTimeOpeningBannedTab = false; // Don't auto-scroll again
+            }
+        }
+
+        private void RefreshBannedPlayersUIOptimized()
+        {
+            try
+            {
+                // Clear existing entries
+                foreach (Transform child in bannedPlayersContent)
                 {
-                    // Fit all players on screen - calculate exact height needed
-                    float totalHeight = index * 60 + 10;
-                    bannedPlayersContentRect2.sizeDelta = new Vector2(0, totalHeight);
-                    
-                    // Reset scroll to top when all players fit on screen
-                    if (bannedScrollRect != null)
+                    Destroy(child.gameObject);
+                }
+
+                var bannedList = bannedPlayers.ToList();
+                if (bannedList.Count == 0)
+                {
+                    CreateNoBannedPlayersMessage();
+                    return;
+                }
+
+                // Sort by ban timestamp - most recent first (FIXED: Use OrderBy instead of OrderByDescending)
+                bannedList = bannedList.OrderBy(kvp => 
+                {
+                    string steamId = kvp.Key;
+                    if (banTimestamps.ContainsKey(steamId))
                     {
-                        bannedScrollRect.verticalNormalizedPosition = 1f;
+                        return banTimestamps[steamId];
                     }
+                    return DateTime.MaxValue; // Put entries without timestamps at the end
+                }).Reverse().ToList(); // Reverse to get newest first
+
+                // Calculate pagination
+                int totalPages = Mathf.CeilToInt((float)bannedList.Count / MAX_VISIBLE_BANNED_ITEMS);
+                bannedPlayersPageIndex = Mathf.Clamp(bannedPlayersPageIndex, 0, Math.Max(0, totalPages - 1));
+                int startIndex = bannedPlayersPageIndex * MAX_VISIBLE_BANNED_ITEMS;
+                int endIndex = Mathf.Min(startIndex + MAX_VISIBLE_BANNED_ITEMS, bannedList.Count);
+
+                // Create pagination header with larger text
+                CreatePaginationHeaderImproved(bannedPlayersPageIndex + 1, totalPages, bannedList.Count);
+
+                // Create navigation buttons
+                CreateNavigationButtons(bannedPlayersPageIndex, totalPages);
+
+                // Create only visible entries
+                for (int i = startIndex; i < endIndex; i++)
+                {
+                    var kvp = bannedList[i];
+                    string steamId = kvp.Key;
+                    string playerName = kvp.Value;
+                    CreateBannedPlayerEntry(steamId, playerName, i - startIndex);
                 }
-             }
-             catch (Exception e)
-             {
-                 ModLogger.LogError($"Error refreshing banned players UI: {e.Message}");
-             }
-         }
+
+                // Update content height for visible items (+3 for header, navigation, and spacing)
+                UpdateBannedContentHeight((endIndex - startIndex) + 3);
+                
+                // Only auto-scroll to top when UI is first opened (not on every refresh)
+                // We'll handle this in the main UI refresh method instead
+            }
+            catch (Exception e)
+            {
+                ModLogger.LogError($"Error refreshing banned players UI: {e.Message}");
+            }
+        }
+
+        private void CreateNoBannedPlayersMessage()
+        {
+            var noBannedObj = new GameObject("NoBannedPlayers");
+            noBannedObj.transform.SetParent(bannedPlayersContent, false);
+            var noBannedText = noBannedObj.AddComponent<Text>();
+            noBannedText.text = "No banned players";
+            noBannedText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            noBannedText.fontSize = 16;
+            noBannedText.color = Color.gray;
+            noBannedText.alignment = TextAnchor.MiddleCenter;
+
+            var noBannedRect = noBannedObj.GetComponent<RectTransform>();
+            noBannedRect.anchorMin = new Vector2(0, 1);
+            noBannedRect.anchorMax = new Vector2(1, 1);
+            noBannedRect.pivot = new Vector2(0.5f, 1);
+            noBannedRect.offsetMin = new Vector2(10, -40);
+            noBannedRect.offsetMax = new Vector2(-10, -10);
+
+            var bannedPlayersContentRect = bannedPlayersContent.GetComponent<RectTransform>();
+            bannedPlayersContentRect.sizeDelta = new Vector2(0, 50);
+        }
+
+        private void CreatePaginationHeaderImproved(int currentPage, int totalPages, int totalCount)
+        {
+            var headerObj = new GameObject("PaginationHeader");
+            headerObj.transform.SetParent(bannedPlayersContent, false);
+            var headerText = headerObj.AddComponent<Text>();
+            headerText.text = $"Banned Players: {totalCount} total (Page {currentPage} of {totalPages})";
+            headerText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            headerText.fontSize = 18; // Increased from 14 to 18
+            headerText.color = Color.yellow;
+            headerText.alignment = TextAnchor.MiddleCenter;
+            headerText.fontStyle = FontStyle.Bold; // Make it bold too
+
+            var headerRect = headerObj.GetComponent<RectTransform>();
+            headerRect.anchorMin = new Vector2(0, 1);
+            headerRect.anchorMax = new Vector2(1, 1);
+            headerRect.pivot = new Vector2(0.5f, 1);
+            headerRect.offsetMin = new Vector2(5, -35); // Made slightly taller
+            headerRect.offsetMax = new Vector2(-5, -5);
+        }
+
+        private void CreateNavigationButtons(int pageIndex, int totalPages)
+        {
+            var navigationObj = new GameObject("NavigationButtons");
+            navigationObj.transform.SetParent(bannedPlayersContent, false);
+
+            var navigationRect = navigationObj.GetComponent<RectTransform>();
+            if (navigationRect == null) navigationRect = navigationObj.AddComponent<RectTransform>();
+            navigationRect.anchorMin = new Vector2(0, 1);
+            navigationRect.anchorMax = new Vector2(1, 1);
+            navigationRect.pivot = new Vector2(0.5f, 1);
+            navigationRect.offsetMin = new Vector2(5, -80); // Positioned below header
+            navigationRect.offsetMax = new Vector2(-5, -45);
+
+            // Show Previous button if we're not on the first page (pageIndex > 0)
+            if (pageIndex > 0)
+            {
+                CreateNavigationButton(navigationObj, "< Previous", new Vector2(0, 0), new Vector2(0.35f, 1), () => {
+                    bannedPlayersPageIndex--;
+                    RefreshBannedPlayersUIOptimized();
+                });
+            }
+
+            // Show Next button if we're not on the last page (pageIndex < totalPages - 1)
+            if (pageIndex < totalPages - 1)
+            {
+                CreateNavigationButton(navigationObj, "Next >", new Vector2(0.65f, 0), new Vector2(1, 1), () => {
+                    bannedPlayersPageIndex++;
+                    RefreshBannedPlayersUIOptimized();
+                });
+            }
+        }
+
+        private void CreatePageIndicator(GameObject parent, string text)
+        {
+            var indicatorObj = new GameObject("PageIndicator");
+            indicatorObj.transform.SetParent(parent.transform, false);
+            var indicatorText = indicatorObj.AddComponent<Text>();
+            indicatorText.text = text;
+            indicatorText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            indicatorText.fontSize = 14;
+            indicatorText.color = Color.white;
+            indicatorText.alignment = TextAnchor.MiddleCenter;
+            indicatorText.fontStyle = FontStyle.Bold;
+
+            var indicatorRect = indicatorObj.GetComponent<RectTransform>();
+            indicatorRect.anchorMin = new Vector2(0.35f, 0);
+            indicatorRect.anchorMax = new Vector2(0.65f, 1);
+            indicatorRect.offsetMin = Vector2.zero;
+            indicatorRect.offsetMax = Vector2.zero;
+        }
+
+        private void CreateNavigationButton(GameObject parent, string text, Vector2 anchorMin, Vector2 anchorMax, System.Action onClick)
+        {
+            var buttonObj = new GameObject("NavigationButton");
+            buttonObj.transform.SetParent(parent.transform, false);
+            var button = buttonObj.AddComponent<Button>();
+            var buttonImage = buttonObj.AddComponent<Image>();
+            buttonImage.color = new Color(0.2f, 0.4f, 0.8f, 0.9f); // Blue color for navigation
+
+            var buttonRect = buttonObj.GetComponent<RectTransform>();
+            buttonRect.anchorMin = anchorMin;
+            buttonRect.anchorMax = anchorMax;
+            buttonRect.offsetMin = new Vector2(5, 0);
+            buttonRect.offsetMax = new Vector2(-5, 0);
+
+            var textObj = new GameObject("ButtonText");
+            textObj.transform.SetParent(buttonObj.transform, false);
+            var buttonText = textObj.AddComponent<Text>();
+            buttonText.text = text;
+            buttonText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            buttonText.fontSize = 14;
+            buttonText.color = Color.white;
+            buttonText.alignment = TextAnchor.MiddleCenter;
+            buttonText.fontStyle = FontStyle.Bold;
+
+            var textRect = textObj.GetComponent<RectTransform>();
+            textRect.anchorMin = Vector2.zero;
+            textRect.anchorMax = Vector2.one;
+            textRect.offsetMin = Vector2.zero;
+            textRect.offsetMax = Vector2.zero;
+
+            button.onClick.AddListener(() => onClick());
+        }
+
+
+        private void CreatePageButton(GameObject parent, string text, Vector2 anchorMin, Vector2 anchorMax, System.Action onClick)
+        {
+            var buttonObj = new GameObject("PageButton");
+            buttonObj.transform.SetParent(parent.transform, false);
+            var button = buttonObj.AddComponent<Button>();
+            var buttonImage = buttonObj.AddComponent<Image>();
+            buttonImage.color = new Color(0.3f, 0.3f, 0.3f, 0.9f);
+
+            var buttonRect = buttonObj.GetComponent<RectTransform>();
+            buttonRect.anchorMin = anchorMin;
+            buttonRect.anchorMax = anchorMax;
+            buttonRect.offsetMin = Vector2.zero;
+            buttonRect.offsetMax = Vector2.zero;
+
+            var textObj = new GameObject("ButtonText");
+            textObj.transform.SetParent(buttonObj.transform, false);
+            var buttonText = textObj.AddComponent<Text>();
+            buttonText.text = text;
+            buttonText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            buttonText.fontSize = 12;
+            buttonText.color = Color.white;
+            buttonText.alignment = TextAnchor.MiddleCenter;
+
+            var textRect = textObj.GetComponent<RectTransform>();
+            textRect.anchorMin = Vector2.zero;
+            textRect.anchorMax = Vector2.one;
+            textRect.offsetMin = Vector2.zero;
+            textRect.offsetMax = Vector2.zero;
+
+            button.onClick.AddListener(() => onClick());
+        }
+
+        private void CreateBannedPlayerEntry(string steamId, string playerName, int visibleIndex)
+        {
+            DateTime banTime = banTimestamps.ContainsKey(steamId) ? banTimestamps[steamId] : DateTime.Now;
+            string banTimeString = banTime.ToString("MM/dd/yyyy HH:mm");
+
+            var bannedEntryObj = new GameObject($"BannedEntry_{visibleIndex}");
+            bannedEntryObj.transform.SetParent(bannedPlayersContent, false);
+            var bannedEntryImage = bannedEntryObj.AddComponent<Image>();
+            bannedEntryImage.color = new Color(0.8f, 0.3f, 0.3f, 0.8f);
+
+            var bannedEntryRect = bannedEntryObj.GetComponent<RectTransform>();
+            bannedEntryRect.anchorMin = new Vector2(0, 1);
+            bannedEntryRect.anchorMax = new Vector2(1, 1);
+            bannedEntryRect.pivot = new Vector2(0.5f, 1);
+            // Adjusted spacing to account for larger header and navigation buttons
+            bannedEntryRect.offsetMin = new Vector2(5, -135 - (visibleIndex * 60)); // Start further down
+            bannedEntryRect.offsetMax = new Vector2(-5, -90 - (visibleIndex * 60));
+
+            // ... rest of the CreateBannedPlayerEntry method stays the same ...
+            var nameObj = new GameObject("PlayerName");
+            nameObj.transform.SetParent(bannedEntryObj.transform, false);
+            var nameText = nameObj.AddComponent<Text>();
+            nameText.text = playerName;
+            nameText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            nameText.fontSize = 14;
+            nameText.color = Color.white;
+            nameText.alignment = TextAnchor.MiddleLeft;
+            var nameRect = nameObj.GetComponent<RectTransform>();
+            nameRect.anchorMin = new Vector2(0, 0);
+            nameRect.anchorMax = new Vector2(0.25f, 1);
+            nameRect.offsetMin = new Vector2(10, 5);
+            nameRect.offsetMax = new Vector2(-5, -5);
+
+            var steamIdObj = new GameObject("SteamID");
+            steamIdObj.transform.SetParent(bannedEntryObj.transform, false);
+            var steamIdText = steamIdObj.AddComponent<Text>();
+            steamIdText.text = steamId;
+            steamIdText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            steamIdText.fontSize = 14;
+            steamIdText.color = Color.gray;
+            steamIdText.alignment = TextAnchor.MiddleLeft;
+            var steamIdRect = steamIdObj.GetComponent<RectTransform>();
+            steamIdRect.anchorMin = new Vector2(0.25f, 0);
+            steamIdRect.anchorMax = new Vector2(0.45f, 1);
+            steamIdRect.offsetMin = new Vector2(5, 5);
+            steamIdRect.offsetMax = new Vector2(-5, -5);
+
+            var timestampObj = new GameObject("Timestamp");
+            timestampObj.transform.SetParent(bannedEntryObj.transform, false);
+            var timestampText = timestampObj.AddComponent<Text>();
+            timestampText.text = banTimeString;
+            timestampText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            timestampText.fontSize = 14;
+            timestampText.color = Color.yellow;
+            timestampText.alignment = TextAnchor.MiddleLeft;
+            var timestampRect = timestampObj.GetComponent<RectTransform>();
+            timestampRect.anchorMin = new Vector2(0.45f, 0);
+            timestampRect.anchorMax = new Vector2(0.65f, 1);
+            timestampRect.offsetMin = new Vector2(5, 5);
+            timestampRect.offsetMax = new Vector2(-5, -5);
+
+            string banReason = banReasons.ContainsKey(steamId) ? banReasons[steamId] : "Manual";
+            var banReasonObj = new GameObject("BanReason");
+            banReasonObj.transform.SetParent(bannedEntryObj.transform, false);
+            var banReasonText = banReasonObj.AddComponent<Text>();
+            banReasonText.text = banReason;
+            banReasonText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            banReasonText.fontSize = 14;
+            banReasonText.color = Color.cyan;
+            banReasonText.alignment = TextAnchor.MiddleLeft;
+            var banReasonRect = banReasonObj.GetComponent<RectTransform>();
+            banReasonRect.anchorMin = new Vector2(0.65f, 0);
+            banReasonRect.anchorMax = new Vector2(0.75f, 1);
+            banReasonRect.offsetMin = new Vector2(5, 5);
+            banReasonRect.offsetMax = new Vector2(-5, -5);
+
+            var unbanButtonObj = new GameObject("UnbanButton");
+            unbanButtonObj.transform.SetParent(bannedEntryObj.transform, false);
+            var unbanButton = unbanButtonObj.AddComponent<Button>();
+            var unbanButtonImage = unbanButtonObj.AddComponent<Image>();
+            unbanButtonImage.color = new Color(0.2f, 0.6f, 0.2f);
+            var unbanButtonTextObj = new GameObject("UnbanButtonText");
+            unbanButtonTextObj.transform.SetParent(unbanButtonObj.transform, false);
+            var unbanButtonText = unbanButtonTextObj.AddComponent<Text>();
+            unbanButtonText.text = "Unban";
+            unbanButtonText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            unbanButtonText.fontSize = 12;
+            unbanButtonText.color = Color.white;
+            unbanButtonText.alignment = TextAnchor.MiddleCenter;
+            var unbanButtonRect = unbanButtonObj.GetComponent<RectTransform>();
+            unbanButtonRect.anchorMin = new Vector2(0.75f, 0.2f);
+            unbanButtonRect.anchorMax = new Vector2(0.98f, 0.8f);
+            unbanButtonRect.offsetMin = Vector2.zero;
+            unbanButtonRect.offsetMax = Vector2.zero;
+            var unbanButtonTextRect = unbanButtonTextObj.GetComponent<RectTransform>();
+            unbanButtonTextRect.anchorMin = Vector2.zero;
+            unbanButtonTextRect.anchorMax = Vector2.one;
+            unbanButtonTextRect.offsetMin = Vector2.zero;
+            unbanButtonTextRect.offsetMax = Vector2.zero;
+            unbanButton.onClick.AddListener(() => UnbanPlayer(steamId, playerName));
+        }
+
+        private void UpdateBannedContentHeight(int items)
+        {
+            var bannedPlayersContentRect2 = bannedPlayersContent.GetComponent<RectTransform>();
+            var bannedScrollRect = bannedPlayersTab.GetComponent<ScrollRect>();
+
+            int index = items;
+            bool needsScrolling = index > 11;
+            if (needsScrolling)
+            {
+                bannedPlayersContentRect2.sizeDelta = new Vector2(0, index * 60 + 10);
+            }
+            else
+            {
+                float totalHeight = index * 60 + 10;
+                bannedPlayersContentRect2.sizeDelta = new Vector2(0, totalHeight);
+                if (bannedScrollRect != null)
+                {
+                    bannedScrollRect.verticalNormalizedPosition = 1f;
+                }
+            }
+        }
 
         private void KickPlayerWithRetry(string steamId, string playerName, bool isBannedPlayer = false)
         {
@@ -1848,11 +2174,15 @@ private System.Collections.IEnumerator RecreateUIAfterDelay()
                     BanPlayer(steamId, playerName, "Manual");
                 }
                 
-                SaveBannedPlayers();
-                
-                // Refresh both UI tabs to show the updated lists
-                RefreshPlayerListUI();
-                RefreshBannedPlayersUI();
+                // Mark for batched saving instead of immediate save
+                needsSave = true;
+
+                // Only refresh UI if it's currently visible
+                if (banUI != null && banUI.activeSelf)
+                {
+                    RefreshPlayerListUI();
+                    RefreshBannedPlayersUI();
+                }
             }
             catch (Exception e)
             {
@@ -1876,11 +2206,15 @@ private System.Collections.IEnumerator RecreateUIAfterDelay()
                     lastKickTime.Remove(steamId);
                     recentlyKickedPlayers.Remove(steamId); // Allow unbanned players to rejoin
                     
-                    SaveBannedPlayers();
-                    
-                    // Refresh both UI tabs to show the updated lists
-                    RefreshPlayerListUI();
-                    RefreshBannedPlayersUI();
+                    // Mark for batched saving instead of immediate save
+                    needsSave = true;
+
+                    // Only refresh UI if it's currently visible
+                    if (banUI != null && banUI.activeSelf)
+                    {
+                        RefreshPlayerListUI();
+                        RefreshBannedPlayersUI();
+                    }
                 }
             }
             catch (Exception e)
@@ -1908,62 +2242,197 @@ private System.Collections.IEnumerator RecreateUIAfterDelay()
 
         private void OnDestroy()
         {
+            // Final save to ensure data isn't lost
+            try
+            {
+                if (needsSave)
+                {
+                    SaveBannedPlayersOptimized();
+                    needsSave = false;
+                }
+            }
+            catch {}
             if (harmony != null)
             {
                 harmony.UnpatchSelf();
             }
         }
 
-        // Harmony patch to automatically kick banned players when they join
-        [HarmonyPatch(typeof(MainMenuManager), "OnLobbyChatMsg")]
-        private static class LobbyChatMsgPatch
+        // 4. ASYNC LOADING for very large lists
+        private System.Collections.IEnumerator LoadBannedPlayersAsync()
         {
-            private static void Postfix(MainMenuManager __instance, LobbyChatMsg_t callback)
+            bannedPlayers.Clear();
+            banTimestamps.Clear();
+            banReasons.Clear();
+
+            string bannedData = bannedPlayersConfig.Value;
+            if (string.IsNullOrEmpty(bannedData))
             {
-                try
+                ModLogger.LogInfo("Loaded 0 banned players asynchronously");
+                yield break;
+            }
+
+            string[] entries = bannedData.Split('|');
+            int processedCount = 0;
+
+            foreach (string entry in entries)
+            {
+                if (!string.IsNullOrEmpty(entry))
                 {
-                    // Only check if we're the host
-                    if (instance != null && instance.isHost)
+                    ProcessBanEntry(entry);
+                    processedCount++;
+
+                    // Yield every 100 entries to prevent frame drops
+                    if (processedCount % 100 == 0)
                     {
-                        byte[] array = new byte[4096];
-                        CSteamID steamIDFriend;
-                        EChatEntryType echatEntryType;
-                        int lobbyChatEntry = SteamMatchmaking.GetLobbyChatEntry((CSteamID)callback.m_ulSteamIDLobby, (int)callback.m_iChatID, out steamIDFriend, array, array.Length, out echatEntryType);
-                        string message = System.Text.Encoding.UTF8.GetString(array, 0, lobbyChatEntry);
-                        
-                        // Check if this is a player join message (you might need to adjust this based on the actual game's join message format)
-                        if (message.Contains("joined") || message.Contains("entered"))
+                        yield return null;
+                    }
+                }
+            }
+
+            ModLogger.LogInfo($"Loaded {bannedPlayers.Count} banned players asynchronously");
+        }
+
+        private void ProcessBanEntry(string entry)
+        {
+            // Check if this is new format (contains safe delimiters) or old format (contains colons)
+            if (entry.Contains(FIELD_DELIMITER))
+            {
+                // New format with safe delimiters
+                string[] parts = entry.Split(new string[] { FIELD_DELIMITER }, StringSplitOptions.None);
+                if (parts.Length >= 2)
+                {
+                    string steamId = parts[0].Trim();
+                    string playerName = parts[1].Trim();
+                    bannedPlayers[steamId] = playerName;
+
+                    if (parts.Length >= 3)
+                    {
+                        if (DateTime.TryParse(parts[2].Trim(), out DateTime timestamp))
                         {
-                            string steamId = steamIDFriend.ToString();
-                            string playerName = SteamFriends.GetFriendPersonaName(steamIDFriend);
-                            
-                            // Don't kick the host
-                            if (instance.IsPlayerHost(steamId))
+                            banTimestamps[steamId] = timestamp;
+                        }
+                        else
+                        {
+                            banTimestamps[steamId] = DateTime.Now;
+                        }
+                    }
+                    else
+                    {
+                        banTimestamps[steamId] = DateTime.Now;
+                    }
+
+                    if (parts.Length >= 4)
+                    {
+                        banReasons[steamId] = parts[3].Trim();
+                    }
+                    else
+                    {
+                        banReasons[steamId] = "Manual";
+                    }
+                }
+            }
+            else
+            {
+                // Old format with colons - use backwards compatible parsing
+                string[] parts = entry.Split(new char[] { ':' }, 4);
+                if (parts.Length >= 2)
+                {
+                    string steamId = parts[0].Trim();
+                    string playerName = parts[1].Trim();
+                    bannedPlayers[steamId] = playerName;
+
+                    if (parts.Length >= 3)
+                    {
+                        string timestampPart = parts[2].Trim();
+                        
+                        if (parts.Length >= 4)
+                        {
+                            if (DateTime.TryParse(timestampPart, out DateTime timestamp))
                             {
-                                PlayerBanMod.ModLogger.LogInfo($"Host player {playerName} (Steam ID: {steamId}) attempted to join - host is immune to bans and kicks");
-                                return;
+                                banTimestamps[steamId] = timestamp;
                             }
-                            
-                            // Check if this player is banned
-                            if (instance.bannedPlayers.ContainsKey(steamId))
+                            else
                             {
-                                PlayerBanMod.ModLogger.LogInfo($"Banned player {playerName} (Steam ID: {steamId}) attempted to join - kicking them immediately");
-                                instance.KickPlayerWithRetry(steamId, playerName, true);
+                                banTimestamps[steamId] = DateTime.Now;
+                            }
+                            banReasons[steamId] = parts[3].Trim();
+                        }
+                        else
+                        {
+                            if (DateTime.TryParse(timestampPart, out DateTime timestamp))
+                            {
+                                banTimestamps[steamId] = timestamp;
+                                banReasons[steamId] = "Manual";
+                            }
+                            else
+                            {
+                                banTimestamps[steamId] = DateTime.Now;
+                                banReasons[steamId] = timestampPart;
                             }
                         }
                     }
-                }
-                catch (Exception e)
-                {
-                    if (instance != null)
+                    else
                     {
-                        PlayerBanMod.ModLogger.LogError($"Error in lobby chat patch: {e.Message}");
+                        banTimestamps[steamId] = DateTime.Now;
+                        banReasons[steamId] = "Manual";
                     }
                 }
             }
         }
 
-        // Alternative patch to monitor player joins through the kickplayershold system
+        // DEBUG METHOD
+
+        private void GenerateTestBansForPagination()
+        {
+            try
+            {
+                ModLogger.LogInfo("Generating 60 test bans for pagination testing...");
+                
+                DateTime baseTime = DateTime.Now.AddDays(-10); // Start 10 days ago
+                
+                for (int i = 0; i < 60; i++)
+                {
+                    // Generate fake Steam ID that won't conflict with real ones
+                    string fakeSteamId = "9999999" + i.ToString("D8"); // Creates IDs like 999999900000001, etc.
+                    
+                    // Generate test player name
+                    string playerName = $"TestPlayer_{i:D3}";
+                    
+                    // Vary the ban times so sorting works properly
+                    DateTime banTime = baseTime.AddMinutes(i * 30); // 30 minutes apart each
+                    
+                    // Vary ban reasons
+                    string[] reasons = { "Testing", "Pagination", "Manual", "Automatic", "Griefing" };
+                    string banReason = reasons[i % reasons.Length];
+                    
+                    // Only add if not already banned (avoid duplicates)
+                    if (!bannedPlayers.ContainsKey(fakeSteamId))
+                    {
+                        bannedPlayers[fakeSteamId] = playerName;
+                        banTimestamps[fakeSteamId] = banTime;
+                        banReasons[fakeSteamId] = banReason;
+                    }
+                }
+                
+                // Mark for saving
+                needsSave = true;
+                
+                ModLogger.LogInfo($"Generated test bans. Total banned players: {bannedPlayers.Count}");
+                
+                // Refresh UI if it's open
+                if (banUI != null && banUI.activeSelf)
+                {
+                    RefreshBannedPlayersUI();
+                }
+            }
+            catch (Exception e)
+            {
+                ModLogger.LogError($"Error generating test bans: {e.Message}");
+            }
+        }
+
+        // monitor player joins through the kickplayershold system
         [HarmonyPatch(typeof(KickPlayersHolder), "AddToDict")]
         private static class PlayerJoinPatch
         {
