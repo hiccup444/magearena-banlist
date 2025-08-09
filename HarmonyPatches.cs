@@ -1,4 +1,5 @@
 using HarmonyLib;
+using System.Collections;
 
 namespace PlayerBanMod
 {
@@ -9,6 +10,8 @@ namespace PlayerBanMod
         {
             try
             {
+                // Removed SteamID->ClientId mapping; no longer needed
+
                 var mod = PlayerBanMod.Instance;
                 if (mod != null && mod.IsCurrentHost())
                 {
@@ -32,5 +35,3 @@ namespace PlayerBanMod
         }
     }
 }
-
-

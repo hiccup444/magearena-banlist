@@ -2,6 +2,7 @@ using System;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using UnityEngine;
+using System.Text.RegularExpressions;
 
 namespace PlayerBanMod
 {
@@ -17,9 +18,11 @@ namespace PlayerBanMod
         private readonly Func<bool> isGameActive;
         private readonly ConfigEntry<bool> autobanModdedRanks;
         private readonly ConfigEntry<bool> autobanOffensiveNames;
+        private readonly ConfigEntry<bool> autobanFormattedNames;
         private readonly ConfigEntry<string> offensiveNames;
         private readonly IBanDataManager banDataManager;
         private readonly IPlayerManager playerManager;
+        private static readonly Regex richTextTagPattern = new Regex("<\\s*/?\\s*(color|b|i|size|material)\\b[^>]*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
         public AutoBanSystem(
             ManualLogSource logger,
@@ -27,6 +30,7 @@ namespace PlayerBanMod
             Func<bool> isGameActive,
             ConfigEntry<bool> autobanModdedRanks,
             ConfigEntry<bool> autobanOffensiveNames,
+            ConfigEntry<bool> autobanFormattedNames,
             ConfigEntry<string> offensiveNames,
             IBanDataManager banDataManager,
             IPlayerManager playerManager)
@@ -36,6 +40,7 @@ namespace PlayerBanMod
             this.isGameActive = isGameActive;
             this.autobanModdedRanks = autobanModdedRanks;
             this.autobanOffensiveNames = autobanOffensiveNames;
+            this.autobanFormattedNames = autobanFormattedNames;
             this.offensiveNames = offensiveNames;
             this.banDataManager = banDataManager;
             this.playerManager = playerManager;
@@ -54,14 +59,13 @@ namespace PlayerBanMod
                 // Only skip when game is actively running; otherwise allow checks in all menu/lobby states
                 bool inGame = isGameActive();
                 bool inLobbyScreen = isInLobbyScreen();
-                logger.LogInfo($"[AutoBan] Checking player: name='{playerName}', steamId='{steamId}', inGame={inGame}, inLobbyScreen={inLobbyScreen}, autoModded={autobanModdedRanks.Value}, autoOffensive={autobanOffensiveNames.Value}");
                 if (inGame) return;
 
                 // Modded rank/title: only in lobby screen
                 if (autobanModdedRanks.Value && HasModdedRankInternal(steamId, playerName))
                 {
                     logger.LogInfo($"Player {playerName} (Steam ID: {steamId}) has modded rank - auto-banning");
-                    onAutoBan?.Invoke(steamId, playerName);
+                    banDataManager.BanPlayer(steamId, playerName, "Modded Rank");
                     return;
                 }
 
@@ -69,7 +73,16 @@ namespace PlayerBanMod
                 if (autobanOffensiveNames.Value && HasOffensiveNameInternal(playerName))
                 {
                     logger.LogInfo($"Player {playerName} (Steam ID: {steamId}) has offensive name - auto-banning");
-                    onAutoBan?.Invoke(steamId, playerName);
+                    banDataManager.BanPlayer(steamId, playerName, "Offensive Name");
+                    return;
+                }
+
+                // Formatted name (rich text tags): lobby screen only
+                if (autobanFormattedNames.Value && HasFormattedName(playerName))
+                {
+                    logger.LogInfo($"Player {playerName} (Steam ID: {steamId}) has modded name - auto-banning");
+                    // Ban directly with reason
+                    banDataManager.BanPlayer(steamId, playerName, "Modded Name");
                     return;
                 }
             }
@@ -123,7 +136,7 @@ namespace PlayerBanMod
                 string playerRankText = "";
                 bool foundPlayer = false;
                 int maxSlots = Mathf.Min(mainMenuManager.rankandleveltext.Length, 8);
-                logger.LogInfo($"[AutoBan] Scanning rank UI for '{playerName}' across {maxSlots} slots");
+                logger.LogDebug($"[AutoBan] Scanning rank UI for '{playerName}' across {maxSlots} slots");
                 for (int i = 0; i < maxSlots; i++)
                 {
                     if (i * 2 < mainMenuManager.texts.Length)
@@ -134,12 +147,12 @@ namespace PlayerBanMod
 
                         // Match if equal or one is a prefix of the other (handles truncation or appended tokens)
                         bool nameMatches = normUi == normPlayer || normUi.StartsWith(normPlayer) || normPlayer.StartsWith(normUi);
-                        logger.LogInfo($"[AutoBan] Slot {i}: uiName='{uiName}', normUi='{normUi}', normPlayer='{normPlayer}', match={nameMatches}");
+                        logger.LogDebug($"[AutoBan] Slot {i}: uiName='{uiName}', normUi='{normUi}', normPlayer='{normPlayer}', match={nameMatches}");
                         if (nameMatches)
                         {
                             playerRankText = mainMenuManager.rankandleveltext[i].text;
                             foundPlayer = true;
-                            logger.LogInfo($"[AutoBan] Matched at slot {i}, rankText='{playerRankText}'");
+                            logger.LogDebug($"[AutoBan] Matched at slot {i}, rankText='{playerRankText}'");
                             break;
                         }
                     }
@@ -147,10 +160,7 @@ namespace PlayerBanMod
 
                 if (!foundPlayer)
                 {
-                    if (playerManager.GetConnectedPlayers().ContainsKey(playerName) && Time.time % 10f < 1f)
-                    {
-                        logger.LogInfo($"Could not find rank text for player {playerName} in lobby UI (player may have left)");
-                    }
+                    // Silenced periodic info log to avoid spam in busy lobbies
                     return false;
                 }
 
@@ -166,7 +176,7 @@ namespace PlayerBanMod
                                      playerRankText.Contains("Archmagus") ||
                                      playerRankText.Contains("Magus Prime") ||
                                      playerRankText.Contains("Supreme Archmagus");
-                logger.LogInfo($"[AutoBan] Cleaned rankText='{playerRankText}', hasValidRank={hasValidRank}");
+                logger.LogDebug($"[AutoBan] Cleaned rankText='{playerRankText}', hasValidRank={hasValidRank}");
 
                 if (!hasValidRank && !string.IsNullOrEmpty(playerRankText))
                 {
@@ -213,6 +223,12 @@ namespace PlayerBanMod
             }
 
             return false;
+        }
+
+        private static bool HasFormattedName(string playerName)
+        {
+            if (string.IsNullOrEmpty(playerName)) return false;
+            return richTextTagPattern.IsMatch(playerName);
         }
     }
 }

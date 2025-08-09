@@ -1,4 +1,5 @@
 using System;
+using System.Reflection;
 using System.Collections.Generic;
 using BepInEx.Logging;
 using UnityEngine;
@@ -25,6 +26,7 @@ namespace PlayerBanMod
         private const int MAX_KICK_ATTEMPTS = Constants.MaxKickAttempts;
         private const float KICK_RETRY_DELAY = Constants.KickRetryDelaySeconds;
 
+
         private readonly MonoBehaviour coroutineHost;
 
         public KickSystem(ManualLogSource logger, MonoBehaviour coroutineHost, Func<bool> isGameActive, Func<bool> isHost, Func<bool> isInLobby, IPlayerManager playerManager)
@@ -49,7 +51,15 @@ namespace PlayerBanMod
 
                 if (kickAttempts.ContainsKey(steamId) && kickAttempts[steamId] >= MAX_KICK_ATTEMPTS)
                 {
-                    logger.LogWarning($"Max kick attempts ({MAX_KICK_ATTEMPTS}) reached for {playerName} (Steam ID: {steamId}) - stopping retry");
+                    logger.LogWarning($"Max kick attempts ({MAX_KICK_ATTEMPTS}) reached for {playerName} (Steam ID: {steamId})");
+                    // If still in-game after all attempts, initiate softlock to neutralize the player
+                    var mainMenuManagerForState = UnityEngine.Object.FindFirstObjectByType<MainMenuManager>();
+                    bool gameHasStartedForState = false;
+                    try { gameHasStartedForState = mainMenuManagerForState != null && mainMenuManagerForState.GameHasStarted; } catch {}
+                    if (gameHasStartedForState && isHost())
+                    {
+                        Softlock.Start(steamId, playerName);
+                    }
                     return;
                 }
 
@@ -58,6 +68,7 @@ namespace PlayerBanMod
                     float timeSinceLastKick = Time.time - lastKickTime[steamId];
                     if (timeSinceLastKick < KICK_RETRY_DELAY)
                     {
+                        logger.LogInfo($"[Kick] Cooldown active for {playerName}: {KICK_RETRY_DELAY - timeSinceLastKick:F2}s remaining");
                         return;
                     }
                 }
@@ -70,22 +81,58 @@ namespace PlayerBanMod
                 string gameState = isGameActive() ? "in-game" : "in-lobby";
                 logger.LogInfo($"Kicking {playerType}: {playerName} (Steam ID: {steamId}) - Attempt {kickAttempts[steamId]}/{MAX_KICK_ATTEMPTS} [{gameState}]");
 
-                if (isGameActive())
+                var mainMenuManager = UnityEngine.Object.FindFirstObjectByType<MainMenuManager>();
+                if (mainMenuManager == null)
                 {
-                    BootstrapNetworkManager.KickPlayer(steamId);
+                    logger.LogError($"MainMenuManager not found - cannot kick {playerName}");
+                    return;
                 }
-                else
+
+                bool gameHasStarted = false;
+                try { gameHasStarted = mainMenuManager.GameHasStarted; } catch {}
+                logger.LogInfo($"[Kick] GameHasStarted={gameHasStarted}");
+
+                if (gameHasStarted)
                 {
-                    var mainMenuManager = UnityEngine.Object.FindFirstObjectByType<MainMenuManager>();
-                    if (mainMenuManager != null)
+                    // In-game: try all paths in quick succession
+                    try
                     {
                         mainMenuManager.KickPlayer(steamId);
                     }
-                    else
+                    catch (Exception ex)
                     {
-                        logger.LogError($"MainMenuManager not found - cannot kick {playerName} in lobby");
-                        return;
+                        logger.LogWarning($"[Kick] MainMenuManager.KickPlayer threw: {ex.Message}");
                     }
+
+                    try
+                    {
+                        if (mainMenuManager.mmmn != null)
+                        {
+                            mainMenuManager.mmmn.KickPlayer(steamId);
+                        }
+                        else
+                        {
+                            logger.LogWarning("[Kick] In-game: mmmn is null; skipping mmmn.KickPlayer");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogWarning($"[Kick] mmmn.KickPlayer threw: {ex.Message}");
+                    }
+
+                    try
+                    {
+                        BootstrapNetworkManager.KickPlayer(steamId);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogWarning($"[Kick] BootstrapNetworkManager.KickPlayer threw: {ex.Message}");
+                    }
+                }
+                else
+                {
+                    // Lobby: use normal MainMenuManager.KickPlayer
+                    mainMenuManager.KickPlayer(steamId);
                 }
 
                 if (!isBannedPlayer)
@@ -95,7 +142,6 @@ namespace PlayerBanMod
                     if (!string.IsNullOrEmpty(playerToRemove.Key))
                     {
                         trackedPlayers.Remove(playerToRemove.Key);
-                        logger.LogInfo($"Immediately removed {playerName} from active players list after kick");
                         playerManager.MarkRecentlyKicked(steamId);
                         if (BanUIManager.IsActive) BanUIManager.RefreshActivePlayers();
                     }
@@ -105,16 +151,33 @@ namespace PlayerBanMod
                 {
                     coroutineHost.StartCoroutine(ScheduleKickRetry(steamId, playerName, isBannedPlayer));
                 }
+                else
+                {
+                    // If we've just hit max attempts, and we're in-game, start softlock
+                    var mainMenuManagerForState = UnityEngine.Object.FindFirstObjectByType<MainMenuManager>();
+                    bool gameHasStartedForState = false;
+                    try { gameHasStartedForState = mainMenuManagerForState != null && mainMenuManagerForState.GameHasStarted; } catch {}
+                    if (gameHasStartedForState && isHost())
+                    {
+                        Softlock.Start(steamId, playerName);
+                    }
+                }
             }
             catch (Exception e)
             {
-                logger.LogError($"Error kicking player {playerName}: {e.Message}");
+                logger.LogError($"Error kicking player {playerName}: {e.Message}\n{e.StackTrace}");
                 if (!kickAttempts.ContainsKey(steamId) || kickAttempts[steamId] < MAX_KICK_ATTEMPTS)
                 {
                     coroutineHost.StartCoroutine(ScheduleKickRetry(steamId, playerName, isBannedPlayer));
                 }
+                else
+                {
+                    // removed implimetation
+                }
             }
         }
+
+
 
         public void ClearKickTracking(string steamId)
         {
@@ -126,12 +189,31 @@ namespace PlayerBanMod
         {
             yield return new WaitForSeconds(KICK_RETRY_DELAY);
 
-            if (isHost() && isInLobby())
+            if (!isHost()) yield break;
+
+            bool inLobbyNow = isInLobby();
+            bool inGameNow = isGameActive();
+            logger.LogInfo($"[Retry] host=true, inLobby={inLobbyNow}, inGame={inGameNow} for {playerName}");
+
+            if (inLobbyNow)
             {
                 var mainMenuManager = UnityEngine.Object.FindFirstObjectByType<MainMenuManager>();
+                if (mainMenuManager == null)
+                {
+                    logger.LogWarning("[Retry] MainMenuManager not found during retry check");
+                    yield break;
+                }
+
+                if (mainMenuManager.kickplayershold == null)
+                {
+                    logger.LogWarning("[Retry] kickplayershold is null during retry check");
+                    yield break;
+                }
+
                 if (mainMenuManager != null && mainMenuManager.kickplayershold != null)
                 {
                     bool playerStillConnected = mainMenuManager.kickplayershold.nametosteamid.ContainsValue(steamId);
+
                     if (playerStillConnected)
                     {
                         string playerType = isBannedPlayer ? "banned player" : "player";
@@ -150,24 +232,30 @@ namespace PlayerBanMod
                             if (!string.IsNullOrEmpty(playerToRemove.Key))
                             {
                                 trackedPlayers.Remove(playerToRemove.Key);
-                                logger.LogInfo($"Removed {playerName} from active players list after successful kick (retry)");
                                 playerManager.MarkRecentlyKicked(steamId);
                                 if (BanUIManager.IsActive) BanUIManager.RefreshActivePlayers();
                             }
                             else
                             {
-                                logger.LogInfo($"{playerName} was already removed from active players list");
                                 if (!playerManager.WasRecentlyKicked(steamId))
                                 {
                                     playerManager.MarkRecentlyKicked(steamId);
-                                    logger.LogInfo($"Marked {playerName} as recently kicked (already removed)");
                                 }
                             }
                         }
 
                         ClearKickTracking(steamId);
+                        // Stop any softlock if it was running for this player
+                        Softlock.Stop(steamId);
                     }
                 }
+            }
+            else if (inGameNow)
+            {
+                // In-game: just retry via main flow which will escalate on attempts
+                string playerType = isBannedPlayer ? "banned player" : "player";
+                logger.LogInfo($"{playerType} {playerName} retrying kick in-game...");
+                KickPlayerWithRetry(steamId, playerName, isBannedPlayer);
             }
         }
     }

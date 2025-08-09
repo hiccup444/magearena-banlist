@@ -27,6 +27,7 @@ namespace PlayerBanMod
 
         private readonly Dictionary<string, string> connectedPlayers = new Dictionary<string, string>(); // name -> steamId
         private readonly Dictionary<string, float> recentlyKickedPlayers = new Dictionary<string, float>(); // steamId -> time
+        private string lastSnapshotKey = string.Empty;
 
         private const float RECENTLY_KICKED_DURATION = Constants.RecentlyKickedDurationSeconds; // seconds
 
@@ -105,6 +106,20 @@ namespace PlayerBanMod
                         }
                     }
 
+                    // Detect changes to active players snapshot and refresh UI if needed
+                    string snapshot = string.Empty;
+                    foreach (var kv in System.Linq.Enumerable.OrderBy(connectedPlayers, p => p.Key))
+                    {
+                        snapshot += kv.Key + ":" + kv.Value + "|";
+                    }
+                    if (!string.Equals(snapshot, lastSnapshotKey))
+                    {
+                        lastSnapshotKey = snapshot;
+                        if (BanUIManager.IsActive)
+                        {
+                            BanUIManager.RefreshActivePlayers();
+                        }
+                    }
                 }
             }
             catch (Exception e)

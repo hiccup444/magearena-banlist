@@ -1,9 +1,12 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Text;
+using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
+using UnityEngine;
 
 namespace PlayerBanMod
 {
@@ -38,9 +41,20 @@ namespace PlayerBanMod
         private readonly Action<string> clearKickTracking;
         private readonly Action<string> removeRecentlyKicked;
 
-        // Safe delimiters to avoid conflicts with typical player names
+        // Safe delimiters for legacy config format
         private const string FIELD_DELIMITER = Constants.FieldDelimiter; // field separator
         private const string ENTRY_DELIMITER = Constants.EntryDelimiter; // entry separator
+
+        // File storage
+        private readonly string bansFilePath;
+        [Serializable]
+        private class BanRecord
+        {
+            public string Name;
+            public string SteamID;
+            public string Date;
+            public string Reason;
+        }
 
         public BanDataManager(
             Dictionary<string, string> bannedPlayers,
@@ -74,6 +88,18 @@ namespace PlayerBanMod
             this.refreshBannedPlayers = refreshBannedPlayers;
             this.clearKickTracking = clearKickTracking;
             this.removeRecentlyKicked = removeRecentlyKicked;
+
+            // Compute bans file path under BepInEx/plugins/BanList/Bans/banned_players.jsonl
+            try
+            {
+                string baseDir = Path.Combine(Paths.PluginPath, "BanList", "Bans");
+                if (!Directory.Exists(baseDir)) Directory.CreateDirectory(baseDir);
+                bansFilePath = Path.Combine(baseDir, "banned_players.jsonl");
+            }
+            catch
+            {
+                bansFilePath = "banned_players.jsonl";
+            }
         }
 
         public bool IsBanned(string steamId)
@@ -95,11 +121,12 @@ namespace PlayerBanMod
 
                 if (!bannedPlayers.ContainsKey(steamId))
                 {
-                    bannedPlayers[steamId] = playerName ?? string.Empty;
+                    string safeName = SanitizePlayerNameForStorage(playerName);
+                    bannedPlayers[steamId] = safeName;
                     banTimestamps[steamId] = DateTime.Now;
                     banReasons[steamId] = string.IsNullOrEmpty(reason) ? "Manual" : reason;
 
-                    logger.LogInfo($"Banned player: {playerName} (Steam ID: {steamId}) at {DateTime.Now} - Reason: {banReasons[steamId]}");
+                    logger.LogInfo($"Banned player: {playerName} (stored as: {safeName}) (Steam ID: {steamId}) at {DateTime.Now} - Reason: {banReasons[steamId]}");
 
                     if (isHost != null && isInLobby != null && isHost() && isInLobby() && kickWithRetry != null)
                     {
@@ -174,34 +201,46 @@ namespace PlayerBanMod
         {
             try
             {
-                var stringBuilder = new StringBuilder(bannedPlayers.Count * 100);
-                bool first = true;
-                foreach (var kvp in bannedPlayers)
+                using (var fs = new FileStream(bansFilePath, FileMode.Create, FileAccess.Write, FileShare.Read))
+                using (var sw = new StreamWriter(fs, Encoding.UTF8))
                 {
-                    if (!first) stringBuilder.Append(ENTRY_DELIMITER);
-                    first = false;
+                    foreach (var kvp in bannedPlayers)
+                    {
+                        string steamId = kvp.Key;
+                        string playerName = kvp.Value ?? string.Empty;
+                        string timestamp = banTimestamps.ContainsKey(steamId)
+                            ? banTimestamps[steamId].ToString("yyyy-MM-dd HH:mm:ss")
+                            : DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                        string reason = banReasons.ContainsKey(steamId) ? banReasons[steamId] : "Manual";
 
-                    string steamId = kvp.Key;
-                    string playerName = kvp.Value ?? string.Empty;
-                    string timestamp = banTimestamps.ContainsKey(steamId)
-                        ? banTimestamps[steamId].ToString("yyyy-MM-dd HH:mm:ss")
-                        : DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-                    string reason = banReasons.ContainsKey(steamId) ? banReasons[steamId] : "Manual";
-
-                    stringBuilder
-                        .Append(steamId).Append(FIELD_DELIMITER)
-                        .Append(playerName).Append(FIELD_DELIMITER)
-                        .Append(timestamp).Append(FIELD_DELIMITER)
-                        .Append(reason);
+                        var record = new BanRecord
+                        {
+                            Name = playerName,
+                            SteamID = steamId,
+                            Date = timestamp,
+                            Reason = reason
+                        };
+                        string json = UnityEngine.JsonUtility.ToJson(record);
+                        sw.WriteLine(json);
+                    }
                 }
-
-                bannedPlayersConfig.Value = stringBuilder.ToString();
-                logger.LogInfo($"Saved {bannedPlayers.Count} banned players with safe delimiters");
+                logger.LogInfo($"Saved {bannedPlayers.Count} banned players to JSONL: {bansFilePath}");
             }
             catch (Exception e)
             {
                 logger.LogError($"Error saving banned players: {e.Message}");
             }
+        }
+
+        private string SanitizePlayerNameForStorage(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return string.Empty;
+            // Replace if it contains any delimiter to avoid breaking config parsing
+            if (name.Contains(FIELD_DELIMITER) || name.Contains(ENTRY_DELIMITER))
+            {
+                return "Player";
+            }
+            return name;
         }
 
         public void LoadBans()
@@ -210,58 +249,21 @@ namespace PlayerBanMod
             banTimestamps.Clear();
             banReasons.Clear();
 
-            string bannedData = bannedPlayersConfig.Value;
-            if (string.IsNullOrEmpty(bannedData))
-            {
-                logger.LogInfo("Loaded 0 banned players");
-                return;
-            }
+            // Migrate from legacy config if present
+            MigrateLegacyConfigIfNeeded();
 
-            bool appearsOldFormat = bannedData.Contains("|") && !bannedData.Contains(ENTRY_DELIMITER);
-            if (appearsOldFormat)
-            {
-                logger.LogInfo("Loading banned players from old format and converting...");
-                LoadOldFormat(bannedData);
-            }
-            else
-            {
-                LoadNewFormat(bannedData);
-            }
-
-            logger.LogInfo($"Loaded {bannedPlayers.Count} banned players");
+            // Load from file
+            LoadFromFile();
+            logger.LogInfo($"Loaded {bannedPlayers.Count} banned players from file");
         }
 
         public IEnumerator LoadBansAsync()
         {
-            bannedPlayers.Clear();
-            banTimestamps.Clear();
-            banReasons.Clear();
-
-            string bannedData = bannedPlayersConfig.Value;
-            if (string.IsNullOrEmpty(bannedData))
-            {
-                logger.LogInfo("Loaded 0 banned players asynchronously");
-                yield break;
-            }
-
-            string[] entries = bannedData.Split('|');
-            int processedCount = 0;
-
-            foreach (string entry in entries)
-            {
-                if (!string.IsNullOrEmpty(entry))
-                {
-                    ProcessBanEntry(entry);
-                    processedCount++;
-
-                    if (processedCount % 100 == 0)
-                    {
-                        yield return null;
-                    }
-                }
-            }
-
-            logger.LogInfo($"Loaded {bannedPlayers.Count} banned players asynchronously");
+            // Async: migrate then load file in one go (file sizes are small)
+            MigrateLegacyConfigIfNeeded();
+            LoadFromFile();
+            logger.LogInfo($"Loaded {bannedPlayers.Count} banned players from file asynchronously");
+            yield break;
         }
 
         private void ProcessBanEntry(string entry)
@@ -443,6 +445,101 @@ namespace PlayerBanMod
                         }
                     }
                 }
+            }
+        }
+
+        private void LoadFromFile()
+        {
+            try
+            {
+                // Ensure directory exists
+                string dir = Path.GetDirectoryName(bansFilePath);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                    logger.LogInfo($"Created bans directory: {dir}");
+                }
+
+                // Create empty file if missing
+                if (!File.Exists(bansFilePath))
+                {
+                    using (File.Create(bansFilePath)) { }
+                    logger.LogInfo($"Created bans file: {bansFilePath}");
+                    return;
+                }
+                var lines = File.ReadAllLines(bansFilePath);
+                foreach (var line in lines)
+                {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    try
+                    {
+                        var rec = UnityEngine.JsonUtility.FromJson<BanRecord>(line);
+                        if (rec == null || string.IsNullOrEmpty(rec.SteamID)) continue;
+                        bannedPlayers[rec.SteamID] = rec.Name ?? string.Empty;
+                        if (!string.IsNullOrEmpty(rec.Date))
+                        {
+                            if (DateTime.TryParse(rec.Date, out var dt)) banTimestamps[rec.SteamID] = dt; else banTimestamps[rec.SteamID] = DateTime.Now;
+                        }
+                        else
+                        {
+                            banTimestamps[rec.SteamID] = DateTime.Now;
+                        }
+                        banReasons[rec.SteamID] = string.IsNullOrEmpty(rec.Reason) ? "Manual" : rec.Reason;
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogWarning($"Failed to parse ban record line: {ex.Message}");
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                logger.LogError($"Error loading bans file: {e.Message}");
+            }
+        }
+
+        private void MigrateLegacyConfigIfNeeded()
+        {
+            try
+            {
+                string bannedData = bannedPlayersConfig.Value;
+                if (string.IsNullOrEmpty(bannedData)) return;
+
+                // Parse legacy config into dictionaries
+                bannedPlayers.Clear();
+                banTimestamps.Clear();
+                banReasons.Clear();
+
+                bool appearsOldFormat = bannedData.Contains("|") && !bannedData.Contains(ENTRY_DELIMITER);
+                if (appearsOldFormat)
+                {
+                    logger.LogInfo("[Migration] Loading banned players from old format...");
+                    LoadOldFormat(bannedData);
+                }
+                else
+                {
+                    logger.LogInfo("[Migration] Loading banned players from legacy config...");
+                    LoadNewFormat(bannedData);
+                }
+
+                // Ensure directory exists before writing
+                string dir = Path.GetDirectoryName(bansFilePath);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                    logger.LogInfo($"Created bans directory for migration: {dir}");
+                }
+
+                // Write to file
+                SaveBans();
+
+                // Clear config to remove outdated field
+                bannedPlayersConfig.Value = string.Empty;
+                logger.LogInfo("[Migration] Migration complete. Cleared legacy config storage.");
+            }
+            catch (Exception e)
+            {
+                logger.LogError($"[Migration] Error migrating legacy config: {e.Message}");
             }
         }
     }

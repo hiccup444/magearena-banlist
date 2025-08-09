@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.RegularExpressions;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using UnityEngine;
@@ -15,6 +16,7 @@ namespace PlayerBanMod
         private static ManualLogSource logger;
         private static ConfigEntry<bool> autobanModdedRanksConfig;
         private static ConfigEntry<bool> autobanOffensiveNamesConfig;
+        private static ConfigEntry<bool> autobanFormattedNamesConfig;
 
         private static Func<Dictionary<string, string>> getConnectedPlayers;
         private static Func<Dictionary<string, string>> getBannedPlayers;
@@ -22,6 +24,7 @@ namespace PlayerBanMod
         private static Func<Dictionary<string, string>> getBanReasons;
         private static Action<string, string> kickPlayer;
         private static Action<string, string> toggleBanPlayer;
+        private static Action<string, string, string> banPlayerWithReason;
         private static Action<string, string> unbanPlayer;
 
         private static GameObject banUI;
@@ -32,6 +35,7 @@ namespace PlayerBanMod
         private static GameObject bannedPlayersTab;
         private static Toggle autobanModdedRanksToggle;
         private static Toggle autobanOffensiveNamesToggle;
+        private static readonly Regex richTextTagPattern = new Regex("<\\s*/?\\s*(color|b|i|size|material)\\b[^>]*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
         private static bool isFirstTimeOpeningBannedTab = true;
         private static int bannedPlayersPageIndex = 0;
@@ -46,17 +50,20 @@ namespace PlayerBanMod
             ManualLogSource log,
             ConfigEntry<bool> autoModded,
             ConfigEntry<bool> autoOffensive,
+            ConfigEntry<bool> autoFormatted,
             Func<Dictionary<string, string>> getConn,
             Func<Dictionary<string, string>> getBanned,
             Func<Dictionary<string, DateTime>> getTimestamps,
             Func<Dictionary<string, string>> getReasons,
             Action<string, string> kick,
             Action<string, string> toggleBan,
-            Action<string, string> unban)
+            Action<string, string> unban,
+            Action<string, string, string> banWithReason)
         {
             logger = log;
             autobanModdedRanksConfig = autoModded;
             autobanOffensiveNamesConfig = autoOffensive;
+            autobanFormattedNamesConfig = autoFormatted;
             getConnectedPlayers = getConn;
             getBannedPlayers = getBanned;
             getBanTimestamps = getTimestamps;
@@ -64,6 +71,7 @@ namespace PlayerBanMod
             kickPlayer = kick;
             toggleBanPlayer = toggleBan;
             unbanPlayer = unban;
+            banPlayerWithReason = banWithReason;
         }
 
         public static bool IsUICreated()
@@ -262,7 +270,7 @@ namespace PlayerBanMod
             var autoModLabelObj = new GameObject("AutobanModdedRanksLabel");
             autoModLabelObj.transform.SetParent(banUIPanel.transform, false);
             var autoModLabel = autoModLabelObj.AddComponent<Text>();
-            autoModLabel.text = "Autoban modded ranks";
+            autoModLabel.text = "Autoban Modded Ranks";
             autoModLabel.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
             autoModLabel.fontSize = 24;
             autoModLabel.color = Color.white;
@@ -287,7 +295,7 @@ namespace PlayerBanMod
             var autoOffLabelObj = new GameObject("AutobanOffensiveNamesLabel");
             autoOffLabelObj.transform.SetParent(banUIPanel.transform, false);
             var autoOffLabel = autoOffLabelObj.AddComponent<Text>();
-            autoOffLabel.text = "Autoban offensive names";
+            autoOffLabel.text = "Autoban Offensive Names";
             autoOffLabel.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
             autoOffLabel.fontSize = 24;
             autoOffLabel.color = Color.white;
@@ -314,6 +322,46 @@ namespace PlayerBanMod
                 autobanOffensiveNamesConfig.Value = value;
                 autoOffToggleImage.color = value ? toggleOnColor : toggleOffColor;
                 logger?.LogInfo($"Autoban offensive names: {value}");
+            });
+
+            var autoFormattedToggleObj = new GameObject("AutobanFormattedNamesToggle");
+            autoFormattedToggleObj.transform.SetParent(banUIPanel.transform, false);
+            var autoFormattedToggle = autoFormattedToggleObj.AddComponent<Toggle>();
+            var autoFormattedToggleImage = autoFormattedToggleObj.AddComponent<Image>();
+            autoFormattedToggleImage.color = toggleOffColor;
+            var autoFormattedToggleRect = autoFormattedToggleObj.GetComponent<RectTransform>();
+
+            autoFormattedToggleRect.anchorMin = new Vector2(0.245f, 0.92f);
+            autoFormattedToggleRect.anchorMax = new Vector2(0.275f, 0.97f);
+            autoFormattedToggleRect.offsetMin = Vector2.zero;
+            autoFormattedToggleRect.offsetMax = Vector2.zero;
+
+            var autoFormattedLabelObj = new GameObject("AutobanFormattedNamesLabel");
+            autoFormattedLabelObj.transform.SetParent(banUIPanel.transform, false);
+            var autoFormattedLabel = autoFormattedLabelObj.AddComponent<Text>();
+            autoFormattedLabel.text = "Autoban Modded Names";
+            autoFormattedLabel.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            autoFormattedLabel.fontSize = 24;
+            autoFormattedLabel.color = Color.white;
+            autoFormattedLabel.alignment = TextAnchor.MiddleLeft;
+            var autoFormattedLabelRect = autoFormattedLabelObj.GetComponent<RectTransform>();
+            autoFormattedLabelRect.anchorMin = new Vector2(0.28f, 0.92f);
+            autoFormattedLabelRect.anchorMax = new Vector2(0.52f, 0.97f);
+            autoFormattedLabelRect.offsetMin = new Vector2(5, 0);
+            autoFormattedLabelRect.offsetMax = new Vector2(-5, 0);
+
+            // Init
+            autoFormattedToggle.isOn = autobanFormattedNamesConfig.Value;
+            autoFormattedToggleImage.color = autoFormattedToggle.isOn ? toggleOnColor : toggleOffColor;
+            autoFormattedToggle.onValueChanged.AddListener(value =>
+            {
+                autobanFormattedNamesConfig.Value = value;
+                autoFormattedToggleImage.color = value ? toggleOnColor : toggleOffColor;
+                logger?.LogInfo($"Autoban formatted names: {value}");
+                if (value)
+                {
+                    BanPlayersWithFormattedNames();
+                }
             });
 
             // Active tab content
@@ -387,6 +435,8 @@ namespace PlayerBanMod
                 bannedTabButtonImage.color = new Color(0.4f, 0.4f, 0.4f, 0.9f);
                 isFirstTimeOpeningBannedTab = true;
                 RefreshBannedPlayers();
+                var bannedScroll = bannedPlayersTab != null ? bannedPlayersTab.GetComponent<ScrollRect>() : null;
+                if (bannedScroll != null) bannedScroll.verticalNormalizedPosition = 1f;
             });
 
             // Initial tab state
@@ -403,6 +453,47 @@ namespace PlayerBanMod
         {
             if (banUI == null) return;
             banUI.SetActive(visible);
+        }
+
+        private static bool IsFormattedName(string playerName)
+        {
+            if (string.IsNullOrEmpty(playerName)) return false;
+            return richTextTagPattern.IsMatch(playerName);
+        }
+
+        private static void BanPlayersWithFormattedNames()
+        {
+            try
+            {
+                var connected = getConnectedPlayers();
+                if (connected == null || connected.Count == 0) return;
+
+                int bannedCount = 0;
+                foreach (var kvp in connected)
+                {
+                    string name = kvp.Key;
+                    string steamId = kvp.Value;
+                    if (IsFormattedName(name))
+                    {
+                        if (banPlayerWithReason != null)
+                        {
+                            banPlayerWithReason(steamId, name, "Modded Name");
+                        }
+                        else
+                        {
+                            toggleBanPlayer(steamId, name);
+                        }
+                        bannedCount++;
+                    }
+                }
+                logger?.LogInfo($"Banned {bannedCount} player(s) with modded names.");
+                RefreshActivePlayers();
+                RefreshBannedPlayers();
+            }
+            catch (System.Exception e)
+            {
+                logger?.LogError($"Error banning modded names: {e.Message}");
+            }
         }
 
         public static void RefreshActivePlayers()
@@ -528,6 +619,12 @@ namespace PlayerBanMod
                     banButtonRect.offsetMax = Vector2.zero;
                     banButton.onClick.AddListener(() => toggleBanPlayer(steamId, playerName));
 
+                    // Highlight entries with modded names
+                    if (IsFormattedName(playerName))
+                    {
+                        playerEntryImage.color = new Color(0.5f, 0.2f, 0.6f, 0.9f);
+                    }
+
                     index++;
                 }
 
@@ -588,12 +685,10 @@ namespace PlayerBanMod
                 // Always repopulate the list
                 RepopulateBannedList(banned, timestamps, reasons);
                 
-                if (isFirstTimeOpeningBannedTab && banned.Count > 11)
-                {
-                    var scroll = bannedPlayersTab.GetComponent<ScrollRect>();
-                    if (scroll != null) scroll.verticalNormalizedPosition = 1f;
-                    isFirstTimeOpeningBannedTab = false;
-                }
+                // Always put to top after refresh
+                var scroll = bannedPlayersTab.GetComponent<ScrollRect>();
+                if (scroll != null) scroll.verticalNormalizedPosition = 1f;
+                isFirstTimeOpeningBannedTab = false;
             }
             catch (Exception e)
             {

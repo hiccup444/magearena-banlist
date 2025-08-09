@@ -13,7 +13,7 @@ using Steamworks;
 
 namespace PlayerBanMod
 {
-    [BepInPlugin("com.playerban.mod", "Player Ban Mod", "1.0.0")]
+    [BepInPlugin("com.playerban.mod", "Player Ban Mod", "1.0.4")]
     [BepInProcess("MageArena.exe")]
     public class PlayerBanMod : BaseUnityPlugin
     {
@@ -27,7 +27,9 @@ namespace PlayerBanMod
         private ConfigEntry<string> bannedPlayersConfig;
         private ConfigEntry<bool> autobanModdedRanksConfig;
         private ConfigEntry<bool> autobanOffensiveNamesConfig;
+        private ConfigEntry<bool> autobanFormattedNamesConfig;
         private ConfigEntry<string> offensiveNamesConfig;
+        private ConfigEntry<KeyCode> uiToggleKeyConfig;
         public Dictionary<string, string> bannedPlayers = new Dictionary<string, string>(); // steamId -> playerName
         private Dictionary<string, DateTime> banTimestamps = new Dictionary<string, DateTime>(); // steamId -> ban timestamp
         private Dictionary<string, string> banReasons = new Dictionary<string, string>(); // steamId -> ban reason
@@ -77,7 +79,9 @@ namespace PlayerBanMod
             bannedPlayersConfig = Config.Bind("BannedPlayers", "BannedSteamIds", "", "Comma-separated list of banned Steam IDs");
             autobanModdedRanksConfig = Config.Bind("Settings", "AutobanModdedRanks", false, "Automatically ban players with modded ranks");
             autobanOffensiveNamesConfig = Config.Bind("Settings", "AutobanOffensiveNames", false, "Automatically ban players with offensive names");
+            autobanFormattedNamesConfig = Config.Bind("Settings", "AutobanFormattedNames", false, "Automatically ban players with formatted/rich-text names (e.g., <color>, <b>)");
             offensiveNamesConfig = Config.Bind("Settings", "OffensiveNames", "discord.gg,cheat", "Comma-separated list of offensive names to ban");
+            uiToggleKeyConfig = Config.Bind("Settings", "UIToggleKey", KeyCode.F2, "Key to toggle the Player Management UI");
             
             // Initialize offensive names with default values if empty
             if (string.IsNullOrEmpty(offensiveNamesConfig.Value))
@@ -107,20 +111,23 @@ namespace PlayerBanMod
             playerManager = new PlayerManager(ModLogger);
             lobbyMonitor = new LobbyMonitor(ModLogger);
             kickSystem = new KickSystem(ModLogger, this, () => IsGameActive(), () => isHost, () => isInLobby, playerManager);
-            autoBanSystem = new AutoBanSystem(ModLogger, () => IsInLobbyScreen(), () => IsGameActive(), autobanModdedRanksConfig, autobanOffensiveNamesConfig, offensiveNamesConfig, banDataManager, playerManager);
+            Softlock.Initialize(ModLogger, this);
+            autoBanSystem = new AutoBanSystem(ModLogger, () => IsInLobbyScreen(), () => IsGameActive(), autobanModdedRanksConfig, autobanOffensiveNamesConfig, autobanFormattedNamesConfig, offensiveNamesConfig, banDataManager, playerManager);
             
             // Initialize UI manager dependencies
             BanUIManager.Initialize(
                 ModLogger,
                 autobanModdedRanksConfig,
                 autobanOffensiveNamesConfig,
+                autobanFormattedNamesConfig,
                 () => playerManager.GetConnectedPlayers(),
                 () => bannedPlayers,
                 () => banTimestamps,
                 () => banReasons,
                 (steamId, playerName) => KickPlayer(steamId, playerName),
                 (steamId, playerName) => ToggleBanPlayer(steamId, playerName),
-                (steamId, playerName) => UnbanPlayer(steamId, playerName)
+                (steamId, playerName) => UnbanPlayer(steamId, playerName),
+                (steamId, playerName, reason) => BanPlayer(steamId, playerName, reason)
             );
             StartCoroutine(banDataManager.LoadBansAsync());
 
@@ -204,8 +211,8 @@ namespace PlayerBanMod
 
         private void Update()
         {
-            // Check for F2 key press to open/close the UI
-            if (Input.GetKeyDown(KeyCode.F2))
+            // Check for configured key press to open/close the UI
+            if (Input.GetKeyDown(uiToggleKeyConfig.Value))
             {
                 if (isHost && isInLobby)
                 {
@@ -262,6 +269,7 @@ namespace PlayerBanMod
                 needsSave = false;
                 lastSaveTime = Time.time;
             }
+
         }
 
         private bool CheckIfInLobby() { return lobbyMonitor != null && lobbyMonitor.IsInLobby; }
@@ -352,6 +360,8 @@ namespace PlayerBanMod
                 harmony.UnpatchSelf();
             }
         }
+
+        
 
         private System.Collections.IEnumerator LoadBannedPlayersAsync() { return banDataManager.LoadBansAsync(); }
 
