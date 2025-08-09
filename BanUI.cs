@@ -9,7 +9,7 @@ using UnityEngine.UI;
 
 namespace PlayerBanMod
 {
-    // Manages the Ban UI and rendering using data provided by the main plugin
+
     public static class BanUIManager
     {
         private static ManualLogSource logger;
@@ -36,6 +36,9 @@ namespace PlayerBanMod
         private static bool isFirstTimeOpeningBannedTab = true;
         private static int bannedPlayersPageIndex = 0;
         private const int MAX_VISIBLE_BANNED_ITEMS = 50;
+        private static string bannedSearchQuery = string.Empty;
+        private static InputField bannedSearchInput;
+        private static bool shouldRestoreFocus = false;
 
         public static bool IsActive => banUI != null && banUI.activeSelf;
 
@@ -61,6 +64,56 @@ namespace PlayerBanMod
             kickPlayer = kick;
             toggleBanPlayer = toggleBan;
             unbanPlayer = unban;
+        }
+
+        public static bool IsUICreated()
+        {
+            return banUI != null;
+        }
+
+        public static void DestroyUI()
+        {
+            try
+            {
+                if (banUI != null)
+                {
+                    logger?.LogInfo("Destroying Ban UI...");
+                    
+                    // Find and destroy the entire canvas
+                    var canvas = banUI.transform.root.gameObject;
+                    if (canvas != null && canvas.name == "BanModCanvas")
+                    {
+                        UnityEngine.Object.Destroy(canvas);
+                    }
+                    else
+                    {
+                        // Fallback - destroy just the UI if we can't find the canvas
+                        UnityEngine.Object.Destroy(banUI);
+                    }
+                    
+                    // Reset all UI references
+                    banUI = null;
+                    banUIPanel = null;
+                    playerListContent = null;
+                    bannedPlayersContent = null;
+                    activePlayersTab = null;
+                    bannedPlayersTab = null;
+                    autobanModdedRanksToggle = null;
+                    autobanOffensiveNamesToggle = null;
+                    bannedSearchInput = null;
+                    
+                    // Reset state
+                    isFirstTimeOpeningBannedTab = true;
+                    bannedPlayersPageIndex = 0;
+                    bannedSearchQuery = string.Empty;
+                    
+                    logger?.LogInfo("Ban UI destroyed successfully");
+                }
+            }
+            catch (Exception e)
+            {
+                logger?.LogError($"Error destroying Ban UI: {e.Message}");
+            }
         }
 
         public static IEnumerator CreateUI()
@@ -323,6 +376,8 @@ namespace PlayerBanMod
                 activeTabButtonImage.color = new Color(0.4f, 0.4f, 0.4f, 0.9f);
                 bannedTabButtonImage.color = new Color(0.3f, 0.3f, 0.3f, 0.9f);
                 RefreshActivePlayers();
+                var scroll = activePlayersTab != null ? activePlayersTab.GetComponent<ScrollRect>() : null;
+                if (scroll != null) scroll.verticalNormalizedPosition = 1f;
             });
             bannedTabButton.onClick.AddListener(() =>
             {
@@ -339,6 +394,9 @@ namespace PlayerBanMod
             bannedTabButtonImage.color = new Color(0.3f, 0.3f, 0.3f, 0.9f);
 
             logger?.LogInfo("Ban UI created");
+            // Ensure active players scroll starts at top
+            var initialScroll = activePlayersTab?.GetComponent<ScrollRect>();
+            if (initialScroll != null) initialScroll.verticalNormalizedPosition = 1f;
         }
 
         public static void SetActive(bool visible)
@@ -351,6 +409,12 @@ namespace PlayerBanMod
         {
             try
             {
+                if (playerListContent == null)
+                {
+                    logger?.LogWarning("RefreshActivePlayers called but playerListContent is null - UI may need recreation");
+                    return;
+                }
+
                 foreach (Transform child in playerListContent)
                 {
                     UnityEngine.Object.Destroy(child.gameObject);
@@ -478,8 +542,9 @@ namespace PlayerBanMod
                 {
                     float totalHeight = index * 60 + 10;
                     contentRect2.sizeDelta = new Vector2(0, totalHeight);
-                    if (scrollRect != null) scrollRect.verticalNormalizedPosition = 1f;
                 }
+                // Always normalize to top after repopulating
+                if (scrollRect != null) scrollRect.verticalNormalizedPosition = 1f;
             }
             catch (Exception e)
             {
@@ -491,43 +556,38 @@ namespace PlayerBanMod
         {
             try
             {
+                if (bannedPlayersContent == null)
+                {
+                    logger?.LogWarning("RefreshBannedPlayers called but bannedPlayersContent is null - UI may need recreation");
+                    return;
+                }
+
+                // Clear existing entries but keep the search/nav controls
                 foreach (Transform child in bannedPlayersContent)
                 {
-                    UnityEngine.Object.Destroy(child.gameObject);
+                    // Only destroy player entries, not the header/nav/search
+                    if (child.name.StartsWith("BannedEntry_"))
+                    {
+                        UnityEngine.Object.Destroy(child.gameObject);
+                    }
                 }
 
                 var banned = getBannedPlayers();
                 var timestamps = getBanTimestamps();
                 var reasons = getBanReasons();
-                var bannedList = banned.ToList();
-                if (bannedList.Count == 0)
+                
+                // Check if controls need to be built (first time or after tab switch)
+                bool needsToBuildControls = bannedPlayersContent.Find("PaginationHeader") == null;
+                
+                if (needsToBuildControls)
                 {
-                    CreateNoBannedPlayersMessage();
-                    return;
+                    // Build header, navigation, and search controls once
+                    BuildBannedPlayerControls();
                 }
-
-                bannedList = bannedList.OrderBy(kvp =>
-                {
-                    string steamId = kvp.Key;
-                    return timestamps.ContainsKey(steamId) ? timestamps[steamId] : DateTime.MaxValue;
-                }).Reverse().ToList();
-
-                int totalPages = Mathf.CeilToInt((float)bannedList.Count / MAX_VISIBLE_BANNED_ITEMS);
-                bannedPlayersPageIndex = Mathf.Clamp(bannedPlayersPageIndex, 0, Math.Max(0, totalPages - 1));
-                int startIndex = bannedPlayersPageIndex * MAX_VISIBLE_BANNED_ITEMS;
-                int endIndex = Mathf.Min(startIndex + MAX_VISIBLE_BANNED_ITEMS, bannedList.Count);
-
-                CreatePaginationHeaderImproved(bannedPlayersPageIndex + 1, totalPages, bannedList.Count);
-                CreateNavigationButtons(bannedPlayersPageIndex, totalPages);
-
-                for (int i = startIndex; i < endIndex; i++)
-                {
-                    var kvp = bannedList[i];
-                    CreateBannedPlayerEntry(kvp.Key, kvp.Value, i - startIndex, timestamps, reasons);
-                }
-
-                UpdateBannedContentHeight((endIndex - startIndex) + 3);
-
+                
+                // Always repopulate the list
+                RepopulateBannedList(banned, timestamps, reasons);
+                
                 if (isFirstTimeOpeningBannedTab && banned.Count > 11)
                 {
                     var scroll = bannedPlayersTab.GetComponent<ScrollRect>();
@@ -541,6 +601,229 @@ namespace PlayerBanMod
             }
         }
 
+        private static void BuildBannedPlayerControls()
+        {
+            // Clear everything first
+            foreach (Transform child in bannedPlayersContent)
+            {
+                UnityEngine.Object.Destroy(child.gameObject);
+            }
+            
+            // Build header
+            CreatePaginationHeaderImproved(1, 1, 0); // Will be updated in RepopulateBannedList
+            
+            // Build navigation with search input
+            CreateNavigationControlsWithSearch();
+        }
+
+        private static void CreateNavigationControlsWithSearch()
+        {
+            var navigationObj = new GameObject("NavigationButtons");
+            navigationObj.transform.SetParent(bannedPlayersContent, false);
+            var navigationRect = navigationObj.AddComponent<RectTransform>();
+            navigationRect.anchorMin = new Vector2(0, 1);
+            navigationRect.anchorMax = new Vector2(1, 1);
+            navigationRect.pivot = new Vector2(0.5f, 1);
+            navigationRect.offsetMin = new Vector2(5, -80);
+            navigationRect.offsetMax = new Vector2(-5, -40);
+
+            // Create search input (this will persist across list updates)
+            var searchObj = new GameObject("BannedSearchInput");
+            searchObj.transform.SetParent(navigationObj.transform, false);
+            var searchImage = searchObj.AddComponent<Image>();
+            searchImage.color = new Color(0.15f, 0.15f, 0.15f, 0.9f);
+            var searchRect = searchObj.GetComponent<RectTransform>();
+            searchRect.anchorMin = new Vector2(0.37f, 0);
+            searchRect.anchorMax = new Vector2(0.63f, 1);
+            searchRect.offsetMin = new Vector2(5, 5);
+            searchRect.offsetMax = new Vector2(-5, -5);
+
+            bannedSearchInput = searchObj.AddComponent<InputField>();
+            bannedSearchInput.text = bannedSearchQuery;
+            bannedSearchInput.lineType = InputField.LineType.SingleLine;
+            bannedSearchInput.characterLimit = 64;
+
+            var placeholderObj = new GameObject("Placeholder");
+            placeholderObj.transform.SetParent(searchObj.transform, false);
+            var placeholderText = placeholderObj.AddComponent<Text>();
+            placeholderText.text = "Search name or SteamID";
+            placeholderText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            placeholderText.fontSize = 12;
+            placeholderText.color = new Color(1, 1, 1, 0.35f);
+            placeholderText.alignment = TextAnchor.MiddleLeft;
+            var placeholderRect = placeholderObj.GetComponent<RectTransform>();
+            placeholderRect.anchorMin = Vector2.zero;
+            placeholderRect.anchorMax = Vector2.one;
+            placeholderRect.offsetMin = new Vector2(8, 0);
+            placeholderRect.offsetMax = new Vector2(-8, 0);
+
+            var textObj = new GameObject("Text");
+            textObj.transform.SetParent(searchObj.transform, false);
+            var inputText = textObj.AddComponent<Text>();
+            inputText.text = bannedSearchQuery;
+            inputText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            inputText.fontSize = 14;
+            inputText.color = Color.white;
+            inputText.alignment = TextAnchor.MiddleLeft;
+            var inputTextRect = textObj.GetComponent<RectTransform>();
+            inputTextRect.anchorMin = Vector2.zero;
+            inputTextRect.anchorMax = Vector2.one;
+            inputTextRect.offsetMin = new Vector2(8, 0);
+            inputTextRect.offsetMax = new Vector2(-8, 0);
+
+            bannedSearchInput.placeholder = placeholderText;
+            bannedSearchInput.textComponent = inputText;
+
+            bannedSearchInput.onValueChanged.RemoveAllListeners();
+            bannedSearchInput.onValueChanged.AddListener((value) =>
+            {
+                bannedSearchQuery = value ?? string.Empty;
+                bannedPlayersPageIndex = 0;
+                
+                // Only repopulate the list, keep controls intact
+                var banned = getBannedPlayers();
+                var timestamps = getBanTimestamps();
+                var reasons = getBanReasons();
+                RepopulateBannedList(banned, timestamps, reasons);
+                
+                var scroll = bannedPlayersTab?.GetComponent<ScrollRect>();
+                if (scroll != null)
+                {
+                    scroll.verticalNormalizedPosition = 1f;
+                }
+            });
+        }
+
+        private static void RepopulateBannedList(
+            Dictionary<string, string> banned, 
+            Dictionary<string, DateTime> timestamps, 
+            Dictionary<string, string> reasons)
+        {
+            // Remove only player entries, keep controls
+            var toDestroy = new List<Transform>();
+            foreach (Transform child in bannedPlayersContent)
+            {
+                if (child.name.StartsWith("BannedEntry_") || child.name == "NoBannedPlayers")
+                {
+                    toDestroy.Add(child);
+                }
+            }
+            foreach (var child in toDestroy)
+            {
+                UnityEngine.Object.Destroy(child.gameObject);
+            }
+
+            var bannedList = banned.ToList();
+            
+            // Apply search filter
+            if (!string.IsNullOrEmpty(bannedSearchQuery))
+            {
+                string q = bannedSearchQuery.Trim().ToLowerInvariant();
+                bannedList = bannedList.Where(kvp =>
+                    (!string.IsNullOrEmpty(kvp.Value) && kvp.Value.ToLowerInvariant().Contains(q)) ||
+                    (!string.IsNullOrEmpty(kvp.Key) && kvp.Key.ToLowerInvariant().Contains(q))
+                ).ToList();
+            }
+
+            // Sort by timestamp
+            bannedList = bannedList.OrderBy(kvp =>
+            {
+                string steamId = kvp.Key;
+                return timestamps.ContainsKey(steamId) ? timestamps[steamId] : DateTime.MaxValue;
+            }).Reverse().ToList();
+
+            // Calculate pagination
+            int totalPages = Mathf.Max(1, Mathf.CeilToInt((float)bannedList.Count / MAX_VISIBLE_BANNED_ITEMS));
+            bannedPlayersPageIndex = Mathf.Clamp(bannedPlayersPageIndex, 0, Math.Max(0, totalPages - 1));
+            int startIndex = bannedPlayersPageIndex * MAX_VISIBLE_BANNED_ITEMS;
+            int endIndex = Mathf.Min(startIndex + MAX_VISIBLE_BANNED_ITEMS, bannedList.Count);
+
+            // Update header text
+            UpdatePaginationHeader(bannedPlayersPageIndex + 1, totalPages, bannedList.Count);
+            
+            // Update navigation buttons
+            UpdateNavigationButtons(bannedPlayersPageIndex, totalPages);
+
+            if (bannedList.Count == 0)
+            {
+                CreateNoBannedPlayersMessage();
+                UpdateBannedContentHeight(3);
+            }
+            else
+            {
+                // Create only the visible player entries
+                for (int i = startIndex; i < endIndex; i++)
+                {
+                    var kvp = bannedList[i];
+                    CreateBannedPlayerEntry(kvp.Key, kvp.Value, i - startIndex, timestamps, reasons);
+                }
+                UpdateBannedContentHeight((endIndex - startIndex) + 3);
+            }
+        }
+
+        private static void UpdateNavigationButtons(int pageIndex, int totalPages)
+        {
+            var navButtons = bannedPlayersContent.Find("NavigationButtons");
+            if (navButtons != null)
+            {
+                // Remove old navigation buttons but keep search
+                var toDestroy = new List<Transform>();
+                foreach (Transform child in navButtons)
+                {
+                    if (child.name == "NavigationButton")
+                    {
+                        toDestroy.Add(child);
+                    }
+                }
+                foreach (var child in toDestroy)
+                {
+                    UnityEngine.Object.Destroy(child.gameObject);
+                }
+
+                // Add new navigation buttons
+                if (pageIndex > 0)
+                {
+                    CreateNavigationButton(navButtons.gameObject, "< Previous", new Vector2(0, 0), new Vector2(0.35f, 1), () =>
+                    {
+                        bannedPlayersPageIndex--;
+                        var banned = getBannedPlayers();
+                        var timestamps = getBanTimestamps();
+                        var reasons = getBanReasons();
+                        RepopulateBannedList(banned, timestamps, reasons);
+                        var scroll = bannedPlayersTab?.GetComponent<ScrollRect>();
+                        if (scroll != null) scroll.verticalNormalizedPosition = 1f;
+                    });
+                }
+
+                if (pageIndex < totalPages - 1)
+                {
+                    CreateNavigationButton(navButtons.gameObject, "Next >", new Vector2(0.65f, 0), new Vector2(1, 1), () =>
+                    {
+                        bannedPlayersPageIndex++;
+                        var banned = getBannedPlayers();
+                        var timestamps = getBanTimestamps();
+                        var reasons = getBanReasons();
+                        RepopulateBannedList(banned, timestamps, reasons);
+                        var scroll = bannedPlayersTab?.GetComponent<ScrollRect>();
+                        if (scroll != null) scroll.verticalNormalizedPosition = 1f;
+                    });
+                }
+            }
+        }
+
+        private static void UpdatePaginationHeader(int currentPage, int totalPages, int totalCount)
+        {
+            var header = bannedPlayersContent.Find("PaginationHeader");
+            if (header != null)
+            {
+                var headerText = header.GetComponent<Text>();
+                if (headerText != null)
+                {
+                    headerText.text = $"Banned Players: {totalCount} total (Page {currentPage} of {totalPages})";
+                }
+            }
+        }
+
         private static void CreateNoBannedPlayersMessage()
         {
             var noBannedObj = new GameObject("NoBannedPlayers");
@@ -551,14 +834,17 @@ namespace PlayerBanMod
             noBannedText.fontSize = 16;
             noBannedText.color = Color.gray;
             noBannedText.alignment = TextAnchor.MiddleCenter;
+            
             var noBannedRect = noBannedObj.GetComponent<RectTransform>();
             noBannedRect.anchorMin = new Vector2(0, 1);
             noBannedRect.anchorMax = new Vector2(1, 1);
             noBannedRect.pivot = new Vector2(0.5f, 1);
-            noBannedRect.offsetMin = new Vector2(10, -40);
-            noBannedRect.offsetMax = new Vector2(-10, -10);
+            
+            noBannedRect.offsetMin = new Vector2(10, -150);
+            noBannedRect.offsetMax = new Vector2(-10, -120);
+            
             var contentRect = bannedPlayersContent.GetComponent<RectTransform>();
-            contentRect.sizeDelta = new Vector2(0, 50);
+            contentRect.sizeDelta = new Vector2(0, 160);
         }
 
         private static void CreatePaginationHeaderImproved(int currentPage, int totalPages, int totalCount)
@@ -578,40 +864,6 @@ namespace PlayerBanMod
             headerRect.pivot = new Vector2(0.5f, 1);
             headerRect.offsetMin = new Vector2(5, -35);
             headerRect.offsetMax = new Vector2(-5, -5);
-        }
-
-        private static void CreateNavigationButtons(int pageIndex, int totalPages)
-        {
-            var navigationObj = new GameObject("NavigationButtons");
-            navigationObj.transform.SetParent(bannedPlayersContent, false);
-            var navigationRect = navigationObj.AddComponent<RectTransform>();
-            navigationRect.anchorMin = new Vector2(0, 1);
-            navigationRect.anchorMax = new Vector2(1, 1);
-            navigationRect.pivot = new Vector2(0.5f, 1);
-            navigationRect.offsetMin = new Vector2(5, -80);
-            navigationRect.offsetMax = new Vector2(-5, -45);
-
-            if (pageIndex > 0)
-            {
-                CreateNavigationButton(navigationObj, "< Previous", new Vector2(0, 0), new Vector2(0.35f, 1), () =>
-                {
-                    bannedPlayersPageIndex--;
-                    RefreshBannedPlayers();
-                    var scroll = bannedPlayersTab != null ? bannedPlayersTab.GetComponent<ScrollRect>() : null;
-                    if (scroll != null) scroll.verticalNormalizedPosition = 1f;
-                });
-            }
-
-            if (pageIndex < totalPages - 1)
-            {
-                CreateNavigationButton(navigationObj, "Next >", new Vector2(0.65f, 0), new Vector2(1, 1), () =>
-                {
-                    bannedPlayersPageIndex++;
-                    RefreshBannedPlayers();
-                    var scroll = bannedPlayersTab != null ? bannedPlayersTab.GetComponent<ScrollRect>() : null;
-                    if (scroll != null) scroll.verticalNormalizedPosition = 1f;
-                });
-            }
         }
 
         private static void CreateNavigationButton(GameObject parent, string text, Vector2 anchorMin, Vector2 anchorMax, Action onClick)
@@ -659,6 +911,7 @@ namespace PlayerBanMod
             bannedEntryRect.anchorMin = new Vector2(0, 1);
             bannedEntryRect.anchorMax = new Vector2(1, 1);
             bannedEntryRect.pivot = new Vector2(0.5f, 1);
+
             bannedEntryRect.offsetMin = new Vector2(5, -135 - (visibleIndex * 60));
             bannedEntryRect.offsetMax = new Vector2(-5, -90 - (visibleIndex * 60));
 
@@ -763,5 +1016,3 @@ namespace PlayerBanMod
         }
     }
 }
-
-

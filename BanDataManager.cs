@@ -48,7 +48,7 @@ namespace PlayerBanMod
             Dictionary<string, string> banReasons,
             ConfigEntry<string> bannedPlayersConfig,
             ManualLogSource logger,
-            // optional side-effect collaborators
+
             Func<string, bool> isPlayerHost = null,
             Func<bool> isHost = null,
             Func<bool> isInLobby = null,
@@ -447,5 +447,3 @@ namespace PlayerBanMod
         }
     }
 }
-
-

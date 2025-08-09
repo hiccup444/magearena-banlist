@@ -62,7 +62,6 @@ namespace PlayerBanMod
                 var mainMenuManager = UnityEngine.Object.FindFirstObjectByType<MainMenuManager>();
                 if (mainMenuManager == null) return false;
 
-                // When the match is in progress, most input should be locked and UI hidden
                 return mainMenuManager.GameHasStarted;
             }
             catch

@@ -11,8 +11,7 @@ namespace PlayerBanMod
     {
         Dictionary<string, string> GetConnectedPlayers();
         void UpdatePlayerList();
-        void AddFakePlayersForTesting();
-        void ClearFakePlayersForTesting();
+        
         bool IsPlayerHost(string steamId);
         string LocalSteamId { get; }
         string LocalPlayerName { get; }
@@ -27,7 +26,6 @@ namespace PlayerBanMod
         private readonly ManualLogSource logger;
 
         private readonly Dictionary<string, string> connectedPlayers = new Dictionary<string, string>(); // name -> steamId
-        private readonly Dictionary<string, string> fakePlayers = new Dictionary<string, string>(); // name -> steamId (for testing)
         private readonly Dictionary<string, float> recentlyKickedPlayers = new Dictionary<string, float>(); // steamId -> time
 
         private const float RECENTLY_KICKED_DURATION = Constants.RecentlyKickedDurationSeconds; // seconds
@@ -63,7 +61,6 @@ namespace PlayerBanMod
         public void ClearOnLeaveLobby()
         {
             connectedPlayers.Clear();
-            fakePlayers.Clear();
             recentlyKickedPlayers.Clear();
         }
 
@@ -74,10 +71,7 @@ namespace PlayerBanMod
                 var mainMenuManager = UnityEngine.Object.FindFirstObjectByType<MainMenuManager>();
                 if (mainMenuManager != null && mainMenuManager.kickplayershold != null)
                 {
-                    // Preserve current fake players
-                    var currentFakePlayers = new Dictionary<string, string>(fakePlayers);
 
-                    // Reset and repopulate with real players
                     connectedPlayers.Clear();
 
                     // Update local player info
@@ -111,77 +105,11 @@ namespace PlayerBanMod
                         }
                     }
 
-                    // Restore fake players (unless recently kicked)
-                    foreach (var kvp in currentFakePlayers)
-                    {
-                        string playerName = kvp.Key;
-                        string steamId = kvp.Value;
-
-                        if (!recentlyKickedPlayers.ContainsKey(steamId))
-                        {
-                            connectedPlayers[playerName] = steamId;
-                        }
-                    }
                 }
             }
             catch (Exception e)
             {
                 logger.LogError($"Error updating player list: {e.Message}");
-            }
-        }
-
-        public void AddFakePlayersForTesting()
-        {
-            try
-            {
-                string[] fakeNames = {
-                    "TestPlayer1", "DebugUser", "FakePlayer123", "MockGamer",
-                    "TestDummy", "BotPlayer", "SampleUser", "DemoPlayer",
-                    "TestUser42", "DebugBot", "FakeGamer", "MockUser"
-                };
-
-                int playersToAdd = UnityEngine.Random.Range(3, 8);
-                for (int i = 0; i < playersToAdd; i++)
-                {
-                    string playerName = fakeNames[UnityEngine.Random.Range(0, fakeNames.Length)] + "_" + UnityEngine.Random.Range(100, 999);
-                    string fakeSteamId = "7656119" + UnityEngine.Random.Range(10000000, 99999999).ToString();
-
-                    while (connectedPlayers.ContainsKey(playerName) || connectedPlayers.ContainsValue(fakeSteamId) ||
-                           fakePlayers.ContainsKey(playerName) || fakePlayers.ContainsValue(fakeSteamId))
-                    {
-                        playerName = fakeNames[UnityEngine.Random.Range(0, fakeNames.Length)] + "_" + UnityEngine.Random.Range(100, 999);
-                        fakeSteamId = "7656119" + UnityEngine.Random.Range(10000000, 99999999).ToString();
-                    }
-
-                    fakePlayers[playerName] = fakeSteamId;
-                    connectedPlayers[playerName] = fakeSteamId;
-                }
-
-                logger.LogInfo($"Added {playersToAdd} fake players for testing. Total players: {connectedPlayers.Count} (including {fakePlayers.Count} fake)");
-            }
-            catch (Exception e)
-            {
-                logger.LogError($"Error adding fake players: {e.Message}");
-            }
-        }
-
-        public void ClearFakePlayersForTesting()
-        {
-            try
-            {
-                int fakeCount = fakePlayers.Count;
-                foreach (var kvp in fakePlayers)
-                {
-                    connectedPlayers.Remove(kvp.Key);
-                    recentlyKickedPlayers.Remove(kvp.Value);
-                }
-                fakePlayers.Clear();
-
-                logger.LogInfo($"Cleared {fakeCount} fake players for testing. Remaining players: {connectedPlayers.Count}");
-            }
-            catch (Exception e)
-            {
-                logger.LogError($"Error clearing fake players: {e.Message}");
             }
         }
 
@@ -215,5 +143,3 @@ namespace PlayerBanMod
         }
     }
 }
-
-

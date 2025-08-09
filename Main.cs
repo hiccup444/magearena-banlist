@@ -39,9 +39,6 @@ namespace PlayerBanMod
 
         // Player tracking
         private IPlayerManager playerManager;
-        
-        // Debug/testing
-        private bool debugMode = true; // Set to false for production
 
         // Ban kick tracking
         private IKickSystem kickSystem;
@@ -58,10 +55,8 @@ namespace PlayerBanMod
         private string bannedPlayersSearchQuery = "";
 
         // For parsing the config file
-        private const string FIELD_DELIMITER = Constants.FieldDelimiter; // Diamond symbol - very unlikely in Steam names
-        private const string ENTRY_DELIMITER = Constants.EntryDelimiter; // Reference mark - very unlikely in Steam names
-
-        
+        private const string FIELD_DELIMITER = Constants.FieldDelimiter; // Diamond symbol
+        private const string ENTRY_DELIMITER = Constants.EntryDelimiter; // Reference mark
 
         // Helper method to check if a player is the host
         public bool IsPlayerHost(string steamId) => playerManager.IsPlayerHost(steamId);
@@ -107,11 +102,13 @@ namespace PlayerBanMod
                 id => { kickSystem?.ClearKickTracking(id); },
                 id => { playerManager?.RemoveRecentlyKicked(id); }
             );
+
             // Initialize player manager
             playerManager = new PlayerManager(ModLogger);
             lobbyMonitor = new LobbyMonitor(ModLogger);
             kickSystem = new KickSystem(ModLogger, this, () => IsGameActive(), () => isHost, () => isInLobby, playerManager);
-            autoBanSystem = new AutoBanSystem(ModLogger, () => IsInLobbyScreen(), autobanModdedRanksConfig, autobanOffensiveNamesConfig, offensiveNamesConfig, banDataManager, playerManager);
+            autoBanSystem = new AutoBanSystem(ModLogger, () => IsInLobbyScreen(), () => IsGameActive(), autobanModdedRanksConfig, autobanOffensiveNamesConfig, offensiveNamesConfig, banDataManager, playerManager);
+            
             // Initialize UI manager dependencies
             BanUIManager.Initialize(
                 ModLogger,
@@ -131,11 +128,6 @@ namespace PlayerBanMod
             harmony.PatchAll();
 
             ModLogger.LogInfo("Player Ban Mod loaded!");
-            
-            if (debugMode)
-            {
-                ModLogger.LogInfo("Debug mode enabled - F3: Add fake players, F4: Clear fake players");
-            }
             
             // Start coroutine to initialize after game loads
             StartCoroutine(InitializeMod());
@@ -201,7 +193,6 @@ namespace PlayerBanMod
             }
         }
 
-        // moved to AutoBanSystem
         private bool HasModdedRank(string steamId, string playerName) { return false; }
         private bool HasOffensiveName(string playerName) { return false; }
 
@@ -222,7 +213,7 @@ namespace PlayerBanMod
                         bool newState = !BanUIManager.IsActive;
                         BanUIManager.SetActive(newState);
                         
-                        // Handle cursor state...
+                        // Handle cursor state
                         if (IsGameActive())
                         {
                             if (newState)
@@ -264,30 +255,6 @@ namespace PlayerBanMod
                 }
             }
             
-            // Debug keys for testing (only in lobby screen, not during game)
-            if (debugMode && isHost && isInLobby && !IsGameActive())
-            {
-                // F3 to add fake players
-                if (Input.GetKeyDown(KeyCode.F3))
-                {
-                    playerManager.AddFakePlayersForTesting();
-                    if (BanUIManager.IsActive) BanUIManager.RefreshActivePlayers();
-                }
-                
-                // F4 to clear fake players
-                if (Input.GetKeyDown(KeyCode.F4))
-                {
-                    playerManager.ClearFakePlayersForTesting();
-                    if (BanUIManager.IsActive) BanUIManager.RefreshActivePlayers();
-                }
-
-                // F5 to generate test bans for pagination testing
-                if (Input.GetKeyDown(KeyCode.F5))
-                {
-                    GenerateTestBansForPagination();
-                }
-            }
-
             // Batched saving - only save periodically
             if (needsSave && Time.time - lastSaveTime > SAVE_INTERVAL)
             {
@@ -297,13 +264,19 @@ namespace PlayerBanMod
             }
         }
 
-        // moved to LobbyMonitor
         private bool CheckIfInLobby() { return lobbyMonitor != null && lobbyMonitor.IsInLobby; }
         private bool CheckIfHost() { return lobbyMonitor != null && lobbyMonitor.IsHost; }
 
         private void OnEnterLobby()
         {
             ModLogger.LogInfo("Entered lobby");
+            
+            // Recreate UI if it doesn't exist
+            if (!BanUIManager.IsUICreated())
+            {
+                StartCoroutine(BanUIManager.CreateUI());
+            }
+            
             UpdateUIForHostStatus();
             playerManager.UpdatePlayerList();
         }
@@ -315,8 +288,8 @@ namespace PlayerBanMod
             // Clear player-related data
             playerManager.ClearOnLeaveLobby();
             
-            // Hide UI if visible
-            if (BanUIManager.IsActive) BanUIManager.SetActive(false);
+            // Destroy UI completely so it can be recreated
+            BanUIManager.DestroyUI();
         }
 
         private void UpdateUIForHostStatus() { }
@@ -344,23 +317,23 @@ namespace PlayerBanMod
 
         private void UnbanPlayer(string steamId, string playerName) { banDataManager.UnbanPlayer(steamId); }
 
-                 // Check if a joining player is banned
-         private void CheckBannedPlayer(string steamId, string playerName)
-         {
-             if (IsPlayerHost(steamId))
-             {
-                 ModLogger.LogInfo($"Host player {playerName} (Steam ID: {steamId}) attempted to join - host is immune to bans and kicks");
-                 return;
-             }
+        // Check if a joining player is banned
+        private void CheckBannedPlayer(string steamId, string playerName)
+        {
+            if (IsPlayerHost(steamId))
+            {
+                ModLogger.LogInfo($"Host player {playerName} (Steam ID: {steamId}) attempted to join - host is immune to bans and kicks");
+                return;
+            }
 
-             lobbyMonitor.CheckBannedOrAutoBanPlayer(
-                 steamId,
-                 playerName,
-                 id => bannedPlayers.ContainsKey(id),
-                 (id, name) => KickPlayerWithRetry(id, name, true),
-                 (id, name) => autoBanSystem.ProcessPlayer(id, name, (bid, bname) => BanPlayer(bid, bname, "Automatic"))
-             );
-         }
+            lobbyMonitor.CheckBannedOrAutoBanPlayer(
+                steamId,
+                playerName,
+                id => bannedPlayers.ContainsKey(id),
+                (id, name) => KickPlayerWithRetry(id, name, true),
+                (id, name) => autoBanSystem.ProcessPlayer(id, name, (bid, bname) => BanPlayer(bid, bname, "Automatic"))
+            );
+        }
 
         private void OnDestroy()
         {
@@ -380,62 +353,9 @@ namespace PlayerBanMod
             }
         }
 
-        // 4. ASYNC LOADING for very large lists
         private System.Collections.IEnumerator LoadBannedPlayersAsync() { return banDataManager.LoadBansAsync(); }
 
         private void ProcessBanEntry(string entry) { }
 
-        // DEBUG METHOD
-
-        private void GenerateTestBansForPagination()
-        {
-            try
-            {
-                ModLogger.LogInfo("Generating 60 test bans for pagination testing...");
-                
-                DateTime baseTime = DateTime.Now.AddDays(-10); // Start 10 days ago
-                
-                for (int i = 0; i < 60; i++)
-                {
-                    // Generate fake Steam ID that won't conflict with real ones
-                    string fakeSteamId = "9999999" + i.ToString("D8"); // Creates IDs like 999999900000001, etc.
-                    
-                    // Generate test player name
-                    string playerName = $"TestPlayer_{i:D3}";
-                    
-                    // Vary the ban times so sorting works properly
-                    DateTime banTime = baseTime.AddMinutes(i * 30); // 30 minutes apart each
-                    
-                    // Vary ban reasons
-                    string[] reasons = { "Testing", "Pagination", "Manual", "Automatic", "Griefing" };
-                    string banReason = reasons[i % reasons.Length];
-                    
-                    // Only add if not already banned (avoid duplicates)
-                    if (!bannedPlayers.ContainsKey(fakeSteamId))
-                    {
-                        bannedPlayers[fakeSteamId] = playerName;
-                        banTimestamps[fakeSteamId] = banTime;
-                        banReasons[fakeSteamId] = banReason;
-                    }
-                }
-                
-                // Mark for saving
-                needsSave = true;
-                
-                ModLogger.LogInfo($"Generated test bans. Total banned players: {bannedPlayers.Count}");
-                
-                // Refresh UI if it's open
-                if (BanUIManager.IsActive)
-                {
-                    BanUIManager.RefreshBannedPlayers();
-                }
-            }
-            catch (Exception e)
-            {
-                ModLogger.LogError($"Error generating test bans: {e.Message}");
-            }
-        }
-
-        // Harmony patches moved to HarmonyPatches.cs
     }
 }
