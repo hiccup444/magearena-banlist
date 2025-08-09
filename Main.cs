@@ -113,6 +113,8 @@ namespace PlayerBanMod
             kickSystem = new KickSystem(ModLogger, this, () => IsGameActive(), () => isHost, () => isInLobby, playerManager);
             Softlock.Initialize(ModLogger, this);
             autoBanSystem = new AutoBanSystem(ModLogger, () => IsInLobbyScreen(), () => IsGameActive(), autobanModdedRanksConfig, autobanOffensiveNamesConfig, autobanFormattedNamesConfig, offensiveNamesConfig, banDataManager, playerManager);
+            RecentPlayersManager.Initialize(ModLogger);
+            RecentPlayersManager.SetBanFunctions(() => bannedPlayers, (steamId, playerName) => ToggleBanPlayer(steamId, playerName));
             
             // Initialize UI manager dependencies
             BanUIManager.Initialize(
@@ -207,7 +209,12 @@ namespace PlayerBanMod
 
         private bool IsGameActive() { return lobbyMonitor != null && lobbyMonitor.IsGameActive(); }
 
-        private void BanPlayer(string steamId, string playerName, string reason) { banDataManager.BanPlayer(steamId, playerName, reason); }
+        private void BanPlayer(string steamId, string playerName, string reason) 
+        { 
+            banDataManager.BanPlayer(steamId, playerName, reason); 
+            
+            RecentPlayersManager.OnBanStatusChanged();
+        }
 
         private void Update()
         {
@@ -219,6 +226,7 @@ namespace PlayerBanMod
                     {
                         bool newState = !BanUIManager.IsActive;
                         BanUIManager.SetActive(newState);
+                        RecentPlayersManager.SetButtonVisible(newState);
                         
                         // Handle cursor state
                         if (IsGameActive())
@@ -250,6 +258,7 @@ namespace PlayerBanMod
                 {
                     // Close UI if it's open but conditions no longer met
                     BanUIManager.SetActive(false);
+                    RecentPlayersManager.SetButtonVisible(false);
                     
                     // If we're closing during game, restore cursor lock
                     if (IsGameActive())
@@ -270,6 +279,46 @@ namespace PlayerBanMod
                 lastSaveTime = Time.time;
             }
 
+            // Capture recent players right after game starts
+            try
+            {
+                var mainMenuManager = FindFirstObjectByType<MainMenuManager>();
+                if (mainMenuManager != null && mainMenuManager.GameHasStarted && isHost)
+                {
+                    if (mainMenuManager.kickplayershold != null)
+                    {
+                        var dict = new Dictionary<string, string>(mainMenuManager.kickplayershold.nametosteamid);
+                        string GetTeamForSteam(string steamId)
+                        {
+                            var players = UnityEngine.Object.FindObjectsByType<PlayerMovement>(FindObjectsSortMode.None);
+                            foreach (var pm in players)
+                            {
+                                if (!string.IsNullOrEmpty(pm.playername) && dict.TryGetValue(pm.playername, out var id) && id == steamId)
+                                {
+                                    try
+                                    {
+                                        var teamField = typeof(PlayerMovement).GetField("playerTeam", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public);
+                                        if (teamField != null)
+                                        {
+                                            int teamNum = (int)teamField.GetValue(pm);
+                                            return teamNum == 0 ? "sorcerer" : teamNum == 2 ? "warlock" : "unknown";
+                                        }
+                                    }
+                                    catch {}
+                                    return "unknown";
+                                }
+                            }
+                            return "unknown";
+                        }
+
+                        RecentPlayersManager.CaptureRecentPlayers(dict, GetTeamForSteam);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                ModLogger.LogError($"Error capturing recent players: {ex.Message}");
+            }
         }
 
         private bool CheckIfInLobby() { return lobbyMonitor != null && lobbyMonitor.IsInLobby; }
@@ -287,6 +336,21 @@ namespace PlayerBanMod
             
             UpdateUIForHostStatus();
             playerManager.UpdatePlayerList();
+            // Ensure Recent Players button exists (create if missing)
+            try
+            {
+                var canvas = FindFirstObjectByType<Canvas>();
+                if (canvas != null)
+                {
+                    RecentPlayersManager.EnsureRecentPlayersButton(canvas);
+                    // Respect current UI visibility
+                    RecentPlayersManager.SetButtonVisible(BanUIManager.IsActive);
+                }
+            }
+            catch (Exception ex)
+            {
+                ModLogger.LogError($"Error ensuring Recent Players button: {ex.Message}");
+            }
         }
 
         private void OnLeaveLobby()
@@ -298,6 +362,7 @@ namespace PlayerBanMod
             
             // Destroy UI completely so it can be recreated
             BanUIManager.DestroyUI();
+            RecentPlayersManager.DestroyRecentPlayersUI();
         }
 
         private void UpdateUIForHostStatus() { }
@@ -321,9 +386,19 @@ namespace PlayerBanMod
             KickPlayerWithRetry(steamId, playerName, false);
         }
 
-        private void ToggleBanPlayer(string steamId, string playerName) { banDataManager.ToggleBanPlayer(steamId, playerName); }
+        private void ToggleBanPlayer(string steamId, string playerName) 
+        { 
+            banDataManager.ToggleBanPlayer(steamId, playerName);
+            
+            RecentPlayersManager.OnBanStatusChanged();
+        }
 
-        private void UnbanPlayer(string steamId, string playerName) { banDataManager.UnbanPlayer(steamId); }
+        private void UnbanPlayer(string steamId, string playerName) 
+        { 
+            banDataManager.UnbanPlayer(steamId); 
+            
+            RecentPlayersManager.OnBanStatusChanged();
+        }
 
         // Check if a joining player is banned
         private void CheckBannedPlayer(string steamId, string playerName)

@@ -140,6 +140,7 @@ namespace PlayerBanMod
             scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
             scaler.referenceResolution = new Vector2(1920, 1080);
             canvasObj.AddComponent<GraphicRaycaster>();
+            RecentPlayersManager.CreateRecentPlayersButton(canvas);
 
             // Root
             banUI = new GameObject("BanModUI");
@@ -426,6 +427,7 @@ namespace PlayerBanMod
                 RefreshActivePlayers();
                 var scroll = activePlayersTab != null ? activePlayersTab.GetComponent<ScrollRect>() : null;
                 if (scroll != null) scroll.verticalNormalizedPosition = 1f;
+                RecentPlayersManager.OnTabChanged();
             });
             bannedTabButton.onClick.AddListener(() =>
             {
@@ -437,6 +439,7 @@ namespace PlayerBanMod
                 RefreshBannedPlayers();
                 var bannedScroll = bannedPlayersTab != null ? bannedPlayersTab.GetComponent<ScrollRect>() : null;
                 if (bannedScroll != null) bannedScroll.verticalNormalizedPosition = 1f;
+                RecentPlayersManager.OnTabChanged();
             });
 
             // Initial tab state
@@ -453,6 +456,7 @@ namespace PlayerBanMod
         {
             if (banUI == null) return;
             banUI.SetActive(visible);
+            RecentPlayersManager.SetButtonVisible(visible);
         }
 
         private static bool IsFormattedName(string playerName)
