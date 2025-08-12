@@ -10,7 +10,6 @@ using UnityEngine.UI;
 
 namespace PlayerBanMod
 {
-
     public static class BanUIManager
     {
         private static ManualLogSource logger;
@@ -37,14 +36,29 @@ namespace PlayerBanMod
         private static Toggle autobanOffensiveNamesToggle;
         private static readonly Regex richTextTagPattern = new Regex("<\\s*/?\\s*(color|b|i|size|material)\\b[^>]*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+        // Logging UI components
+        private static GameObject loggingButton;
+        private static GameObject loggingPanel;
+        private static Transform logContent;
+        private static bool isLoggingVisible = false;
+        private static List<string> logMessages = new List<string>();
+        private const int MAX_LOG_MESSAGES = 1000;
+
         private static bool isFirstTimeOpeningBannedTab = true;
         private static int bannedPlayersPageIndex = 0;
         private const int MAX_VISIBLE_BANNED_ITEMS = 50;
         private static string bannedSearchQuery = string.Empty;
         private static InputField bannedSearchInput;
         private static bool shouldRestoreFocus = false;
+        
+        // UI auto-rebuild system
+        private static bool isWaitingForUIRebuild = false;
+        private static float lastUIRebuildWarningTime = 0f;
+        private const float UI_REBUILD_DELAY = 5f; // 5 seconds delay before auto-rebuild
 
         public static bool IsActive => banUI != null && banUI.activeSelf;
+        
+        public static bool IsAutoRebuildActive => isWaitingForUIRebuild;
 
         public static void Initialize(
             ManualLogSource log,
@@ -78,6 +92,87 @@ namespace PlayerBanMod
         {
             return banUI != null;
         }
+        
+        public static bool IsUIHealthy()
+        {
+            return banUI != null && 
+                   playerListContent != null && 
+                   bannedPlayersContent != null && 
+                   activePlayersTab != null && 
+                   bannedPlayersTab != null;
+        }
+        
+        public static void TriggerAutoRebuild()
+        {
+            if (!isWaitingForUIRebuild)
+            {
+                HandleUIRecreationWarning();
+            }
+        }
+        
+        public static void CancelAutoRebuild()
+        {
+            isWaitingForUIRebuild = false;
+            logger?.LogInfo("UI auto-rebuild cancelled");
+        }
+        
+        private static void HandleUIRecreationWarning()
+        {
+            if (isWaitingForUIRebuild)
+            {
+                return; // Already waiting for rebuild
+            }
+            
+            // Check if we've had too many warnings recently
+            if (Time.time - lastUIRebuildWarningTime < 2f) // Prevent spam warnings
+            {
+                return;
+            }
+            
+            lastUIRebuildWarningTime = Time.time;
+            isWaitingForUIRebuild = true;
+            
+            logger?.LogWarning("UI recreation warning detected - will attempt auto-rebuild in 5 seconds if UI is still not present");
+            
+            // Start coroutine to wait and check if rebuild is needed
+            if (UnityEngine.Object.FindFirstObjectByType<MonoBehaviour>() != null)
+            {
+                UnityEngine.Object.FindFirstObjectByType<MonoBehaviour>().StartCoroutine(CheckAndRebuildUI());
+            }
+            else
+            {
+                isWaitingForUIRebuild = false;
+            }
+        }
+        
+        private static System.Collections.IEnumerator CheckAndRebuildUI()
+        {
+            logger?.LogInfo($"Waiting {UI_REBUILD_DELAY} seconds before checking UI health...");
+            yield return new WaitForSeconds(UI_REBUILD_DELAY);
+            
+            // Check if UI is still broken after 5 seconds
+            if (!IsUICreated() || playerListContent == null || bannedPlayersContent == null || loggingButton == null)
+            {
+                logger?.LogWarning("UI still not properly initialized after 5 seconds - triggering auto-rebuild");
+                
+                // Destroy any existing UI components
+                DestroyUI();
+                
+                // Wait a frame for cleanup
+                yield return null;
+                
+                // Recreate the UI
+                yield return CreateUI();
+                
+                logger?.LogInfo("UI auto-rebuild completed");
+            }
+            else
+            {
+                logger?.LogInfo("UI appears to be working now - no rebuild needed");
+            }
+            
+            isWaitingForUIRebuild = false;
+        }
 
         public static void DestroyUI()
         {
@@ -110,6 +205,11 @@ namespace PlayerBanMod
                     autobanOffensiveNamesToggle = null;
                     bannedSearchInput = null;
                     
+                    // Reset logging UI references
+                    loggingButton = null;
+                    loggingPanel = null;
+                    isLoggingVisible = false;
+                    
                     // Reset state
                     isFirstTimeOpeningBannedTab = true;
                     bannedPlayersPageIndex = 0;
@@ -126,6 +226,16 @@ namespace PlayerBanMod
 
         public static IEnumerator CreateUI()
         {
+            // Check if UI already exists to prevent duplicates
+            if (banUI != null)
+            {
+                logger?.LogInfo("Ban UI already exists, skipping creation");
+                yield break;
+            }
+
+            // Clean up any existing UI elements to prevent duplicates
+            CleanupExistingUI();
+
             // Wait a bit more for the game to fully initialize
             yield return new WaitForSeconds(1f);
 
@@ -141,7 +251,7 @@ namespace PlayerBanMod
             scaler.referenceResolution = new Vector2(1920, 1080);
             canvasObj.AddComponent<GraphicRaycaster>();
             RecentPlayersManager.CreateRecentPlayersButton(canvas);
-
+            
             // Root
             banUI = new GameObject("BanModUI");
             banUI.transform.SetParent(canvasObj.transform, false);
@@ -428,6 +538,7 @@ namespace PlayerBanMod
                 var scroll = activePlayersTab != null ? activePlayersTab.GetComponent<ScrollRect>() : null;
                 if (scroll != null) scroll.verticalNormalizedPosition = 1f;
                 RecentPlayersManager.OnTabChanged();
+                OnTabChanged();
             });
             bannedTabButton.onClick.AddListener(() =>
             {
@@ -440,6 +551,7 @@ namespace PlayerBanMod
                 var bannedScroll = bannedPlayersTab != null ? bannedPlayersTab.GetComponent<ScrollRect>() : null;
                 if (bannedScroll != null) bannedScroll.verticalNormalizedPosition = 1f;
                 RecentPlayersManager.OnTabChanged();
+                OnTabChanged();
             });
 
             // Initial tab state
@@ -450,6 +562,11 @@ namespace PlayerBanMod
             // Ensure active players scroll starts at top
             var initialScroll = activePlayersTab?.GetComponent<ScrollRect>();
             if (initialScroll != null) initialScroll.verticalNormalizedPosition = 1f;
+            
+            // Create Logging button now that BanModUI exists
+            CreateLoggingButton(canvas);
+            
+
         }
 
         public static void SetActive(bool visible)
@@ -457,6 +574,725 @@ namespace PlayerBanMod
             if (banUI == null) return;
             banUI.SetActive(visible);
             RecentPlayersManager.SetButtonVisible(visible);
+            SetLoggingButtonVisible(visible);
+        }
+
+        // Logging button and panel methods
+        private static void CreateLoggingButton(Canvas canvas)
+        {
+            // Check if button already exists
+            if (loggingButton != null)
+            {
+                logger?.LogInfo("Logging button already exists, skipping creation");
+                return;
+            }
+
+            // Create Logging Button as child of BanModUI
+            loggingButton = new GameObject("LoggingButton");
+            
+            // Find BanModUI as a child of BanModCanvas (same approach as RecentPlayersManager)
+            GameObject banModUI = null;
+            var banModCanvas = GameObject.Find("BanModCanvas");
+            if (banModCanvas != null)
+            {
+                Transform banModUITransform = banModCanvas.transform.Find("BanModUI");
+                if (banModUITransform != null)
+                {
+                    banModUI = banModUITransform.gameObject;
+                }
+            }
+            
+            if (banModUI != null)
+            {
+                loggingButton.transform.SetParent(banModUI.transform, false);
+                logger?.LogInfo("Logging button created as child of BanModUI");
+            }
+            else
+            {
+                // Fallback to canvas if BanModUI not found yet
+                loggingButton.transform.SetParent(canvas.transform, false);
+                logger?.LogWarning("BanModUI not found, logging button created as child of canvas (fallback)");
+            }
+
+            var buttonComponent = loggingButton.AddComponent<Button>();
+            var buttonImage = loggingButton.AddComponent<Image>();
+            buttonImage.color = new Color(0.8f, 0.4f, 0.2f, 0.9f); // Orange color
+
+            var buttonRect = loggingButton.GetComponent<RectTransform>();
+            // Position in bottom right corner
+            buttonRect.anchorMin = new Vector2(1, 0);
+            buttonRect.anchorMax = new Vector2(1, 0);
+            buttonRect.pivot = new Vector2(1, 0);
+            buttonRect.anchoredPosition = new Vector2(-24, 24); // offset from bottom-right
+            buttonRect.sizeDelta = new Vector2(200, 52);
+
+            // Set high sorting order to render on top
+            loggingButton.transform.SetAsLastSibling();
+
+            // Button Text
+            var textObj = new GameObject("ButtonText");
+            textObj.transform.SetParent(loggingButton.transform, false);
+            var buttonText = textObj.AddComponent<Text>();
+            buttonText.text = "Logging";
+            buttonText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            buttonText.fontSize = 14;
+            buttonText.color = Color.white;
+            buttonText.alignment = TextAnchor.MiddleCenter;
+            buttonText.fontStyle = FontStyle.Bold;
+
+            var textRect = textObj.GetComponent<RectTransform>();
+            textRect.anchorMin = Vector2.zero;
+            textRect.anchorMax = Vector2.one;
+            textRect.offsetMin = Vector2.zero;
+            textRect.offsetMax = Vector2.zero;
+
+            // Button click event
+            buttonComponent.onClick.AddListener(ToggleLoggingPanel);
+
+            // Start hidden - only show when Ban UI is active
+            loggingButton.SetActive(false);
+
+            logger?.LogInfo("Logging button created (initially hidden)");
+        }
+
+        public static void SetLoggingButtonVisible(bool visible)
+        {
+            if (loggingButton == null)
+            {
+                if (visible)
+                {
+                    // Create the button if it doesn't exist and we want to show it
+                    var canvas = GameObject.Find("BanModCanvas")?.GetComponent<Canvas>();
+                    if (canvas != null)
+                    {
+                        CreateLoggingButton(canvas);
+                    }
+                }
+                return;
+            }
+
+            loggingButton.SetActive(visible);
+
+            // If hiding the button or UI, also hide the panel
+            if (!visible && isLoggingVisible)
+            {
+                HideLoggingPanel();
+            }
+        }
+
+        private static void ToggleLoggingPanel()
+        {
+            if (isLoggingVisible)
+            {
+                HideLoggingPanel();
+            }
+            else
+            {
+                ShowLoggingPanel();
+            }
+        }
+
+        private static System.Collections.IEnumerator DelayedUIUpdate()
+        {
+            yield return null; // Wait one frame
+            logger?.LogInfo("Running delayed UI update");
+            UpdateLogDisplay();
+        }
+
+        public static void TestLoggingSystem()
+        {
+            logger?.LogInfo("TestLoggingSystem called");
+            
+            AddLogMessage($"[{DateTime.Now:HH:mm:ss}] === UI LOGGING TEST ===");
+            AddLogMessage($"[{DateTime.Now:HH:mm:ss}] Test message 1: Basic message");
+            AddLogMessage($"[{DateTime.Now:HH:mm:ss}] Test message 2: Player1 killed Player2 with Sword");
+            AddLogMessage($"[{DateTime.Now:HH:mm:ss}] Test message 3: Wizard casted Fireball at level 5");
+            AddLogMessage($"[{DateTime.Now:HH:mm:ss}] Test message 4: WARNING: Fast respawn detected!");
+            AddLogMessage($"[{DateTime.Now:HH:mm:ss}] === END TEST ===");
+            
+            logger?.LogInfo($"Added test messages, total count: {logMessages.Count}");
+            
+            // Force refresh if panel is visible
+            if (isLoggingVisible)
+            {
+                ForceRefreshLogDisplay();
+            }
+        }
+
+        private static void ShowLoggingPanel()
+        {
+            if (loggingPanel == null)
+            {
+                logger?.LogInfo("ShowLoggingPanel called - panel exists: False, messages count: " + logMessages.Count);
+                CreateLoggingPanel();
+            }
+            else if (!loggingPanel.activeSelf)
+            {
+                // Panel exists but is inactive, just reactivate it
+                logger?.LogInfo("ShowLoggingPanel called - reactivating existing panel");
+                loggingPanel.SetActive(true);
+            }
+
+            if (loggingPanel != null)
+            {
+                isLoggingVisible = true;
+                
+                // Load previous logs from log.jsonl file if this is the first time opening the panel
+                // AND we're not currently in an active game session
+                if (logMessages.Count == 0)
+                {
+                    try
+                    {
+                        // Check if we're in an active game session
+                        var mainMenuManager = UnityEngine.Object.FindFirstObjectByType<MainMenuManager>();
+                        bool isInActiveGame = mainMenuManager != null && mainMenuManager.GameHasStarted;
+                        
+                        if (!isInActiveGame)
+                        {
+                            logger?.LogInfo("Loading previous logs from log.jsonl...");
+                            KillLogger.Instance.LoadPreviousLogs();
+                            logger?.LogInfo($"Loaded previous logs, total messages: {logMessages.Count}");
+                        }
+                        else
+                        {
+                            logger?.LogInfo("Game is active - skipping previous log loading");
+                        }
+                        
+                        // If no logs were loaded, add the startup message
+                        if (logMessages.Count == 0)
+                        {
+                            AddLogMessage($"[{DateTime.Now:HH:mm:ss}] === Logging panel created ===");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        logger?.LogError($"Error loading previous logs: {ex.Message}");
+                        // Add startup message as fallback
+                        AddLogMessage($"[{DateTime.Now:HH:mm:ss}] === Logging panel created ===");
+                    }
+                }
+                else
+                {
+                    logger?.LogInfo($"Logging panel opened with {logMessages.Count} previously loaded messages");
+                }
+                
+                // Update the display immediately - no need for delay with the new structure
+                UpdateLogDisplay();
+                
+                // Scroll to bottom when opening the UI (but not when adding new messages)
+                var scrollRect = logContent.GetComponentInParent<ScrollRect>();
+                if (scrollRect != null)
+                {
+                    scrollRect.verticalNormalizedPosition = 0f; // 0 = bottom, 1 = top
+                    logger?.LogInfo("Successfully scrolled to bottom on UI open");
+                }
+                
+                logger?.LogInfo($"Logging panel shown with {logMessages.Count} messages");
+            }
+        }
+
+        private static void AddDebugTestMessage()
+        {
+            string testMessage = $"[{DateTime.Now:HH:mm:ss}] DEBUG: Logging panel opened - this is a test message";
+            
+            // Add directly to the list (bypassing the normal AddLogMessage to avoid recursion)
+            logMessages.Add(testMessage);
+            logger?.LogInfo($"Added debug test message: {testMessage}");
+            
+            // Keep only the last MAX_LOG_MESSAGES
+            if (logMessages.Count > MAX_LOG_MESSAGES)
+            {
+                logMessages.RemoveAt(0);
+            }
+        }
+
+        public static bool IsLoggingSystemHealthy()
+        {
+            bool healthy = loggingButton != null && 
+                        (loggingPanel == null || (loggingPanel != null && logContent != null));
+            
+            logger?.LogInfo($"Logging system health check: {healthy} (button: {loggingButton != null}, panel: {loggingPanel != null}, content: {logContent != null})");
+            
+            return healthy;
+        }
+
+        public static void ForceRefreshLogDisplay()
+        {
+            logger?.LogInfo($"ForceRefreshLogDisplay called - isLoggingVisible: {isLoggingVisible}, logContent exists: {logContent != null}");
+            
+            if (isLoggingVisible && logContent != null)
+            {
+                UpdateLogDisplay();
+                logger?.LogInfo($"Forced refresh of log display with {logMessages.Count} messages");
+            }
+            else
+            {
+                logger?.LogWarning($"Cannot force refresh - panel visible: {isLoggingVisible}, content exists: {logContent != null}");
+            }
+        }
+
+        private static void HideLoggingPanel()
+        {
+            if (loggingPanel != null)
+            {
+                loggingPanel.SetActive(false);
+            }
+            isLoggingVisible = false;
+            logger?.LogInfo("Logging panel hidden");
+        }
+
+        public static void AddLogMessage(string message)
+        {
+            if (string.IsNullOrEmpty(message))
+            {
+                logger?.LogWarning("Attempted to add null or empty log message");
+                return;
+            }
+
+            try
+            {
+                // Log before adding
+                logger?.LogInfo($"Attempting to add message: {message}");
+
+                // Add to our list
+                logMessages.Add(message);
+                logger?.LogInfo($"Added message to list (total: {logMessages.Count}): {message}");
+
+                // Keep only the last MAX_LOG_MESSAGES
+                if (logMessages.Count > MAX_LOG_MESSAGES)
+                {
+                    logMessages.RemoveAt(0);
+                }
+
+                // Update UI display if the panel is currently visible
+                if (isLoggingVisible)
+                {
+                    logger?.LogInfo("Updating log display");
+                    UpdateLogDisplay();
+                }
+
+                // Also log to BepInEx console
+                logger?.LogInfo($"UI Log: {message}");
+            }
+            catch (Exception e)
+            {
+                logger?.LogError($"Error adding log message: {e.Message}\nStack trace: {e.StackTrace}");
+            }
+        }
+
+        /// <summary>
+        /// Clears all log messages from the UI and updates the display
+        /// </summary>
+        public static void ClearLogMessages()
+        {
+            try
+            {
+                logger?.LogInfo("Clearing all log messages");
+                logMessages.Clear();
+                
+                // Update UI display if the panel is currently visible
+                if (isLoggingVisible)
+                {
+                    UpdateLogDisplay();
+                }
+            }
+            catch (Exception e)
+            {
+                logger?.LogError($"Error clearing log messages: {e.Message}\nStack trace: {e.StackTrace}");
+            }
+        }
+
+        public static void LoadPreviousGameLogs()
+        {
+            try
+            {
+                var killLogger = KillLogger.Instance;
+                if (killLogger == null)
+                {
+                    AddLogMessage("Kill logger not available");
+                    return;
+                }
+
+                var previousKills = killLogger.GetPreviousGameKills();
+                if (previousKills.Count > 0)
+                {
+                    AddLogMessage($"Loading {previousKills.Count} kills from previous game...");
+                    
+                    foreach (var kill in previousKills)
+                    {
+                        string logMessage = kill.KillerName == "Environment" 
+                            ? $"{kill.VictimName} died from {kill.CauseOfDeath}"
+                            : $"{kill.KillerName} killed {kill.VictimName} with {kill.CauseOfDeath}";
+                        
+                        AddLogMessage($"[PREV] {logMessage}");
+                    }
+                    
+                    AddLogMessage($"Finished loading previous game logs");
+                }
+                else
+                {
+                    AddLogMessage("No previous game logs available");
+                }
+            }
+            catch (Exception e)
+            {
+                logger?.LogError($"Error loading previous game logs: {e.Message}");
+                AddLogMessage($"Error loading previous game logs: {e.Message}");
+            }
+        }
+
+
+
+
+
+        private static void UpdateLogDisplay()
+        {
+            if (logContent == null) 
+            {
+                logger?.LogError("UpdateLogDisplay called but logContent is null");
+                return;
+            }
+
+            try
+            {
+                logger?.LogInfo($"UpdateLogDisplay starting with {logMessages.Count} messages");
+
+                // Clear existing children - using the same approach as RecentPlayersManager
+                foreach (Transform child in logContent)
+                {
+                    UnityEngine.Object.Destroy(child.gameObject);
+                }
+
+                if (logMessages.Count == 0)
+                {
+                    // Create a "no messages" placeholder - using the same structure as RecentPlayersManager
+                    var noMsgObj = new GameObject("NoMessages");
+                    noMsgObj.transform.SetParent(logContent, false);
+                    var noMsgText = noMsgObj.AddComponent<Text>();
+                    noMsgText.text = "No log messages yet...";
+                    noMsgText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+                    noMsgText.fontSize = 14;
+                    noMsgText.color = Color.gray;
+                    noMsgText.alignment = TextAnchor.MiddleCenter;
+
+                    var noMsgRect = noMsgObj.GetComponent<RectTransform>();
+                    if (noMsgRect != null)
+                    {
+                        // Use the exact same positioning as RecentPlayersManager
+                        noMsgRect.anchorMin = new Vector2(0, 1);
+                        noMsgRect.anchorMax = new Vector2(1, 1);
+                        noMsgRect.pivot = new Vector2(0.5f, 1);
+                        noMsgRect.offsetMin = new Vector2(10, -35);
+                        noMsgRect.offsetMax = new Vector2(-10, -5);
+                    }
+                    
+                    var contentRect = logContent.GetComponent<RectTransform>();
+                    if (contentRect != null)
+                    {
+                        contentRect.sizeDelta = new Vector2(0, 40);
+                    }
+                    return;
+                }
+
+                // Create log message entries - using the exact same structure as RecentPlayersManager.CreatePlayerEntry
+                for (int i = 0; i < logMessages.Count; i++)
+                {
+                    var message = logMessages[i];
+                    
+                    // Create entry container - same as RecentPlayersManager
+                    var entryObj = new GameObject($"LogMessage_{i}");
+                    entryObj.transform.SetParent(logContent, false);
+                    
+                    var entryImage = entryObj.AddComponent<Image>();
+                    entryImage.color = new Color(0.2f, 0.2f, 0.2f, 0.7f);
+                    
+                    var entryRect = entryObj.GetComponent<RectTransform>();
+                    if (entryRect != null)
+                    {
+                        // Use the exact same positioning as RecentPlayersManager
+                        entryRect.anchorMin = new Vector2(0, 1);
+                        entryRect.anchorMax = new Vector2(1, 1);
+                        entryRect.pivot = new Vector2(0.5f, 1);
+                        entryRect.offsetMin = new Vector2(5, -30 - (i * 35));
+                        entryRect.offsetMax = new Vector2(-5, -5 - (i * 35));
+                    }
+
+                    // Create message text - same structure as RecentPlayersManager
+                    var messageTextObj = new GameObject("MessageText");
+                    messageTextObj.transform.SetParent(entryObj.transform, false);
+                    var messageText = messageTextObj.AddComponent<Text>();
+                    messageText.text = message;
+                    messageText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+                    messageText.fontSize = 12;
+                    
+                    // Set text color based on message content - warnings in yellow
+                    if (message.Contains("WARNING:"))
+                    {
+                        messageText.color = Color.yellow;
+                    }
+                    else
+                    {
+                        messageText.color = Color.white;
+                    }
+                    
+                    messageText.alignment = TextAnchor.MiddleLeft;
+                    
+                    var messageTextRect = messageTextObj.GetComponent<RectTransform>();
+                    if (messageTextRect != null)
+                    {
+                        // Use the same text positioning as RecentPlayersManager
+                        messageTextRect.anchorMin = new Vector2(0, 0);
+                        messageTextRect.anchorMax = new Vector2(1, 1);
+                        messageTextRect.offsetMin = new Vector2(8, 2);
+                        messageTextRect.offsetMax = new Vector2(-5, -2);
+                    }
+                }
+
+                // Update content size - using the same approach as RecentPlayersManager
+                var contentRect2 = logContent.GetComponent<RectTransform>();
+                if (contentRect2 != null)
+                {
+                    contentRect2.sizeDelta = new Vector2(0, logMessages.Count * 35 + 5);
+                    logger?.LogInfo($"Set content size to height: {logMessages.Count * 35 + 5}");
+                }
+
+                    // Don't scroll automatically when updating display - only scroll when opening UI
+
+                logger?.LogInfo($"UpdateLogDisplay completed - displayed {logMessages.Count} messages");
+            }
+            catch (Exception e)
+            {
+                logger?.LogError($"Error updating log display: {e.Message}\nStack trace: {e.StackTrace}");
+            }
+        }
+
+        private static void CreateLoggingPanel()
+        {
+            logger?.LogInfo("CreateLoggingPanel() called");
+
+            try
+            {
+                // Find the canvas
+                var canvas = GameObject.Find("BanModCanvas")?.GetComponent<Canvas>();
+                if (canvas == null)
+                {
+                    logger?.LogError("No canvas found for Logging panel");
+                    return;
+                }
+
+                logger?.LogInfo($"Creating panel on canvas: {canvas.name}");
+
+                // Create panel container
+                loggingPanel = new GameObject("LoggingPanel");
+                if (loggingPanel == null)
+                {
+                    logger?.LogError("Failed to create LoggingPanel GameObject");
+                    return;
+                }
+
+                // Set parent first
+                loggingPanel.transform.SetParent(canvas.transform, false);
+
+                // Add Image component
+                var panelImage = loggingPanel.AddComponent<Image>();
+                if (panelImage == null)
+                {
+                    logger?.LogError("Failed to add Image component to LoggingPanel");
+                    UnityEngine.Object.Destroy(loggingPanel);
+                    loggingPanel = null;
+                    return;
+                }
+                panelImage.color = new Color(0.1f, 0.1f, 0.1f, 0.95f);
+
+                // Get RectTransform (should exist since we added Image)
+                var panelRect = loggingPanel.GetComponent<RectTransform>();
+                if (panelRect == null)
+                {
+                    logger?.LogError("Failed to get RectTransform from LoggingPanel");
+                    UnityEngine.Object.Destroy(loggingPanel);
+                    loggingPanel = null;
+                    return;
+                }
+
+                // Position in center-right area
+                panelRect.anchorMin = new Vector2(0.5f, 0.2f);
+                panelRect.anchorMax = new Vector2(0.9f, 0.8f);
+                panelRect.offsetMin = Vector2.zero;
+                panelRect.offsetMax = Vector2.zero;
+
+                // Add border - wrap in try-catch as this is non-critical
+                try
+                {
+                    var outline = loggingPanel.AddComponent<Outline>();
+                    if (outline != null)
+                    {
+                        outline.effectColor = Color.white;
+                        outline.effectDistance = new Vector2(2, 2);
+                    }
+                }
+                catch (System.Exception e)
+                {
+                    logger?.LogWarning($"Failed to add Outline component: {e.Message}");
+                }
+
+                // Set very high sorting order to ensure it renders on top of everything
+                loggingPanel.transform.SetAsLastSibling();
+                
+                // Add Canvas component for sorting - wrap in try-catch as this might fail
+                try
+                {
+                    var panelCanvas = loggingPanel.AddComponent<Canvas>();
+                    if (panelCanvas != null)
+                    {
+                        panelCanvas.overrideSorting = true;
+                        panelCanvas.sortingOrder = 2000; // Higher than the main UI canvas
+                    }
+
+                    // Add GraphicRaycaster so buttons work
+                    var graphicRaycaster = loggingPanel.AddComponent<GraphicRaycaster>();
+                    if (graphicRaycaster == null)
+                    {
+                        logger?.LogWarning("Failed to add GraphicRaycaster to LoggingPanel");
+                    }
+                }
+                catch (System.Exception e)
+                {
+                    logger?.LogWarning($"Failed to add Canvas/GraphicRaycaster components: {e.Message}");
+                }
+
+
+
+                // Create scroll area for log messages - using the EXACT same structure as RecentPlayersManager
+                try
+                {
+                    var scrollObj = new GameObject("ScrollArea");
+                    if (scrollObj != null)
+                    {
+                        scrollObj.transform.SetParent(loggingPanel.transform, false);
+                        var scrollRect = scrollObj.AddComponent<ScrollRect>();
+                        var scrollImage = scrollObj.AddComponent<Image>();
+                        
+                        if (scrollImage != null)
+                        {
+                            scrollImage.color = new Color(0.05f, 0.05f, 0.05f, 0.8f);
+                        }
+
+                        scrollObj.AddComponent<Mask>();
+
+                        var scrollRectTransform = scrollObj.GetComponent<RectTransform>();
+                        if (scrollRectTransform != null)
+                        {
+                            scrollRectTransform.anchorMin = new Vector2(0, 0);
+                            scrollRectTransform.anchorMax = new Vector2(1, 1);
+                            scrollRectTransform.offsetMin = new Vector2(5, 5);
+                            scrollRectTransform.offsetMax = new Vector2(-5, -5);
+                        }
+
+                        // Create Content container - using the EXACT same structure as RecentPlayersManager
+                        var logContentObj = new GameObject("Content");
+                        if (logContentObj != null)
+                        {
+                            logContentObj.transform.SetParent(scrollObj.transform, false);
+                            
+                            // Add RectTransform component explicitly like RecentPlayersManager does
+                            var logContentRectTransform = logContentObj.AddComponent<RectTransform>();
+                            if (logContentRectTransform != null)
+                            {
+                                // Use the EXACT same anchoring as RecentPlayersManager
+                                logContentRectTransform.anchorMin = new Vector2(0, 1);
+                                logContentRectTransform.anchorMax = new Vector2(1, 1);
+                                logContentRectTransform.pivot = new Vector2(0.5f, 1);
+                            }
+
+                            // Store reference to log content for adding messages
+                            logContent = logContentObj.transform;
+
+                            if (logContent != null)
+                            {
+                                logger?.LogInfo($"LogContent created: {logContent.name}");
+                                logger?.LogInfo($"LogContent parent: {logContent.parent?.name ?? "null"}");
+                            }
+                            else
+                            {
+                                logger?.LogError("LogContent is null after creation!");
+                            }
+
+                            // Setup ScrollRect - using the EXACT same approach as RecentPlayersManager
+                            if (scrollRect != null && logContentRectTransform != null)
+                            {
+                                scrollRect.content = logContentRectTransform;
+                                scrollRect.horizontal = false;
+                                scrollRect.vertical = true;
+                                scrollRect.scrollSensitivity = 10f;
+
+                                logger?.LogInfo("ScrollRect and content setup completed");
+                            }
+                        }
+                    }
+                }
+                catch (System.Exception e)
+                {
+                    logger?.LogError($"Failed to create content area: {e.Message}");
+                }
+
+
+
+                // Add click-away functionality - wrap in try-catch as this is non-critical
+                try
+                {
+                    AddLoggingClickAwayHandler(canvas);
+                }
+                catch (System.Exception e)
+                {
+                    logger?.LogWarning($"Failed to add click-away handler: {e.Message}");
+                }
+
+                logger?.LogInfo("CreateLoggingPanel() completed successfully");
+            }
+            catch (System.Exception e)
+            {
+                logger?.LogError($"Critical error in CreateLoggingPanel(): {e.Message}\nStack trace: {e.StackTrace}");
+                
+                // Cleanup on failure
+                if (loggingPanel != null)
+                {
+                    UnityEngine.Object.Destroy(loggingPanel);
+                    loggingPanel = null;
+                }
+            }
+        }
+
+        private static void AddLoggingClickAwayHandler(Canvas canvas)
+        {
+            // Create invisible overlay to detect clicks outside the panel
+            var overlayObj = new GameObject("LoggingClickAwayOverlay");
+            overlayObj.transform.SetParent(canvas.transform, false);
+            overlayObj.transform.SetSiblingIndex(Mathf.Max(0, loggingPanel.transform.GetSiblingIndex() - 1));
+
+            var overlayImage = overlayObj.AddComponent<Image>();
+            overlayImage.color = new Color(0, 0, 0, 0); // Transparent
+            overlayImage.raycastTarget = true;
+
+            var overlayRect = overlayObj.GetComponent<RectTransform>();
+            overlayRect.anchorMin = Vector2.zero;
+            overlayRect.anchorMax = Vector2.one;
+            overlayRect.offsetMin = Vector2.zero;
+            overlayRect.offsetMax = Vector2.zero;
+
+            var overlayButton = overlayObj.AddComponent<Button>();
+            overlayButton.onClick.AddListener(() => {
+                HideLoggingPanel();
+                UnityEngine.Object.Destroy(overlayObj);
+            });
+        }
+
+        public static void OnTabChanged()
+        {
+            if (isLoggingVisible)
+            {
+                HideLoggingPanel();
+                logger?.LogInfo("Logging panel hidden due to tab change");
+            }
         }
 
         private static bool IsFormattedName(string playerName)
@@ -507,6 +1343,7 @@ namespace PlayerBanMod
                 if (playerListContent == null)
                 {
                     logger?.LogWarning("RefreshActivePlayers called but playerListContent is null - UI may need recreation");
+                    HandleUIRecreationWarning();
                     return;
                 }
 
@@ -660,6 +1497,7 @@ namespace PlayerBanMod
                 if (bannedPlayersContent == null)
                 {
                     logger?.LogWarning("RefreshBannedPlayers called but bannedPlayersContent is null - UI may need recreation");
+                    HandleUIRecreationWarning();
                     return;
                 }
 
@@ -1112,6 +1950,66 @@ namespace PlayerBanMod
                 bannedPlayersContentRect2.sizeDelta = new Vector2(0, totalHeight);
                 if (bannedScrollRect != null) bannedScrollRect.verticalNormalizedPosition = 1f;
             }
+        }
+
+        public static void CleanupExistingUI()
+        {
+            try
+            {
+                // Find and destroy any existing BanModCanvas objects
+                var existingCanvases = GameObject.FindObjectsByType<GameObject>(FindObjectsSortMode.None)
+                    .Where(obj => obj.name == "BanModCanvas")
+                    .ToArray();
+
+                if (existingCanvases.Length > 1)
+                {
+                    logger?.LogWarning($"Found {existingCanvases.Length} BanModCanvas objects, cleaning up duplicates");
+                    
+                    // Keep the first one, destroy the rest
+                    for (int i = 1; i < existingCanvases.Length; i++)
+                    {
+                        if (existingCanvases[i] != null)
+                        {
+                            GameObject.DestroyImmediate(existingCanvases[i]);
+                            logger?.LogInfo($"Destroyed duplicate BanModCanvas {i}");
+                        }
+                    }
+                }
+
+                // Reset our references
+                banUI = null;
+                banUIPanel = null;
+                playerListContent = null;
+                bannedPlayersContent = null;
+                activePlayersTab = null;
+                bannedPlayersTab = null;
+                loggingButton = null;
+                loggingPanel = null;
+                logContent = null;
+                
+                // Reset RecentPlayersManager references
+                RecentPlayersManager.CleanupExistingUI();
+                
+                logger?.LogInfo("Existing UI references cleared");
+            }
+            catch (Exception ex)
+            {
+                logger?.LogError($"Error cleaning up existing UI: {ex.Message}");
+            }
+        }
+
+        public static IEnumerator ForceRecreateUI()
+        {
+            logger?.LogInfo("Force recreating Ban UI...");
+            
+            // Clean up existing UI completely
+            CleanupExistingUI();
+            
+            // Wait a moment for cleanup to complete
+            yield return new WaitForSeconds(0.1f);
+            
+            // Create new UI
+            yield return CreateUI();
         }
     }
 }

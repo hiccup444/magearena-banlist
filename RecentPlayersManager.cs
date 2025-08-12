@@ -19,6 +19,7 @@ namespace PlayerBanMod
         private static Canvas mainCanvas;
         private static DateTime lastGameStartTime = DateTime.MinValue;
         private static bool isWaitingForBanModUI = false; // Flag to prevent multiple coroutines
+        private static bool hasCapturedCurrentGame = false; // Flag to prevent duplicate captures in same game session
         
         // References to ban/unban functionality
         private static Func<Dictionary<string, string>> getBannedPlayers;
@@ -239,6 +240,23 @@ namespace PlayerBanMod
         public static bool IsButtonCreated()
         {
             return recentPlayersButton != null;
+        }
+
+        public static void CleanupExistingUI()
+        {
+            try
+            {
+                // Reset our references
+                recentPlayersButton = null;
+                recentPlayersPanel = null;
+                isWaitingForBanModUI = false;
+                
+                logger?.LogInfo("RecentPlayersManager UI references cleared");
+            }
+            catch (Exception ex)
+            {
+                logger?.LogError($"Error cleaning up RecentPlayersManager UI: {ex.Message}");
+            }
         }
 
         public static void EnsureRecentPlayersButton(Canvas canvas = null)
@@ -702,14 +720,16 @@ namespace PlayerBanMod
                 return;
             }
 
-            var gameStartTime = DateTime.Now;
-            
-            // Only update if this is a new game (prevent duplicate captures)
-            if ((gameStartTime - lastGameStartTime).TotalSeconds < 180)
+            // Only capture if we haven't already captured for this game session
+            if (hasCapturedCurrentGame)
             {
                 return;
             }
+
+            var gameStartTime = DateTime.Now;
             
+            // Mark that we've captured for this game session
+            hasCapturedCurrentGame = true;
             lastGameStartTime = gameStartTime;
 
             // Clear previous game's players and capture new ones
@@ -730,7 +750,7 @@ namespace PlayerBanMod
                 });
             }
 
-            logger?.LogInfo($"Captured {currentGamePlayers.Count} players from game started at {gameStartTime}");
+            logger?.LogInfo($"Captured {currentGamePlayers.Count} players from game started at {gameStartTime} (capture flag set to true)");
             
             // Save to file
             SaveRecentPlayersToFile(gameStartTime);
@@ -969,6 +989,13 @@ namespace PlayerBanMod
             {
                 logger?.LogError($"Error destroying Recent Players UI: {e.Message}");
             }
+        }
+
+        // Call this when leaving lobby to reset capture state
+        public static void OnLeaveLobby()
+        {
+            hasCapturedCurrentGame = false;
+            logger?.LogInfo("Reset recent players capture state - ready for new game session");
         }
 
         // Call this when ban status changes to refresh the Recent Players panel

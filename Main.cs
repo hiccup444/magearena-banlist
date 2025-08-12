@@ -3,6 +3,7 @@ using BepInEx.Configuration;
 using BepInEx.Logging;
 using HarmonyLib;
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -147,6 +148,11 @@ namespace PlayerBanMod
             // Wait for game to fully load
             yield return new WaitForSeconds(2f);
 
+            // Logging system is already initialized via ModLogger
+
+            // Initialize KillLogger to create log directory and file
+            _ = KillLogger.Instance;
+
             // Create UI
             StartCoroutine(BanUIManager.CreateUI());
 
@@ -278,6 +284,12 @@ namespace PlayerBanMod
                 needsSave = false;
                 lastSaveTime = Time.time;
             }
+            
+            // Periodic UI health check - only when in lobby and host
+            if (isHost && isInLobby && Time.frameCount % 300 == 0) // Check every 300 frames (roughly every 5 seconds at 60fps)
+            {
+                CheckUIHealth();
+            }
 
             // Capture recent players right after game starts
             try
@@ -323,10 +335,70 @@ namespace PlayerBanMod
 
         private bool CheckIfInLobby() { return lobbyMonitor != null && lobbyMonitor.IsInLobby; }
         private bool CheckIfHost() { return lobbyMonitor != null && lobbyMonitor.IsHost; }
+        
+        private void CheckUIHealth()
+        {
+            try
+            {
+                // Only check if we're supposed to have UI
+                if (!BanUIManager.IsUICreated())
+                {
+                    ModLogger.LogWarning("UI health check: UI not created - attempting recreation");
+                    StartCoroutine(BanUIManager.CreateUI());
+                    return;
+                }
+                
+                // Check if UI components are healthy
+                if (!BanUIManager.IsUIHealthy())
+                {
+                    ModLogger.LogWarning("UI health check: UI components missing - triggering auto-rebuild");
+                    StartCoroutine(TriggerUIAutoRebuild());
+                }
+            }
+            catch (Exception ex)
+            {
+                ModLogger.LogError($"Error during UI health check: {ex.Message}");
+            }
+        }
+        
+        private System.Collections.IEnumerator TriggerUIAutoRebuild()
+        {
+            ModLogger.LogInfo("Starting UI auto-rebuild process...");
+            
+            // Destroy existing UI
+            BanUIManager.DestroyUI();
+            RecentPlayersManager.DestroyRecentPlayersUI();
+            
+            // Wait for cleanup
+            yield return new WaitForSeconds(0.5f);
+            
+            // Recreate UI
+            yield return BanUIManager.CreateUI();
+            
+            // Ensure Recent Players button exists
+            try
+            {
+                var canvas = FindFirstObjectByType<Canvas>();
+                if (canvas != null)
+                {
+                    RecentPlayersManager.EnsureRecentPlayersButton(canvas);
+                    RecentPlayersManager.SetButtonVisible(BanUIManager.IsActive);
+                }
+            }
+            catch (Exception ex)
+            {
+                ModLogger.LogError($"Error ensuring Recent Players button during auto-rebuild: {ex.Message}");
+            }
+            
+            ModLogger.LogInfo("UI auto-rebuild completed");
+        }
 
         private void OnEnterLobby()
         {
             ModLogger.LogInfo("Entered lobby");
+            
+            // Clean up any existing UI elements to prevent duplicates
+            BanUIManager.CleanupExistingUI();
             
             // Recreate UI if it doesn't exist
             if (!BanUIManager.IsUICreated())
@@ -336,6 +408,10 @@ namespace PlayerBanMod
             
             UpdateUIForHostStatus();
             playerManager.UpdatePlayerList();
+            
+            // Start monitoring game state for kill logging using existing LobbyMonitor
+            StartCoroutine(MonitorGameStateWithLobbyMonitor());
+            
             // Ensure Recent Players button exists (create if missing)
             try
             {
@@ -357,12 +433,80 @@ namespace PlayerBanMod
         {
             ModLogger.LogInfo("Left lobby - clearing player data and UI");
             
+            // Stop kill logging and save logs
+            KillLogger.Instance.StopGameLogging();
+            
             // Clear player-related data
             playerManager.ClearOnLeaveLobby();
             
-            // Destroy UI completely so it can be recreated
-            BanUIManager.DestroyUI();
-            RecentPlayersManager.DestroyRecentPlayersUI();
+            // Reset recent players capture state
+            RecentPlayersManager.OnLeaveLobby();
+            
+            // Hide UI
+            BanUIManager.SetActive(false);
+            RecentPlayersManager.SetButtonVisible(false);
+        }
+
+        private void HandleDuplicateUIDetection()
+        {
+            try
+            {
+                // Find all BanModCanvas objects
+                var allCanvases = FindObjectsByType<GameObject>(FindObjectsSortMode.None)
+                    .Where(obj => obj.name == "BanModCanvas")
+                    .ToArray();
+
+                if (allCanvases.Length > 1)
+                {
+                    ModLogger.LogWarning($"Detected {allCanvases.Length} duplicate BanModCanvas objects - cleaning up");
+                    
+                    // Force recreate the UI to fix duplicates
+                    StartCoroutine(BanUIManager.ForceRecreateUI());
+                }
+            }
+            catch (Exception ex)
+            {
+                ModLogger.LogError($"Error handling duplicate UI detection: {ex.Message}");
+            }
+        }
+
+        private System.Collections.IEnumerator MonitorGameStateWithLobbyMonitor()
+        {
+            bool wasGameActive = false;
+            
+            while (isInLobby)
+            {
+                try
+                {
+                    // Use existing LobbyMonitor methods instead of duplicating logic
+                    bool isGameActive = lobbyMonitor.IsGameActive();
+                    
+                    // Check if game state changed
+                    if (isGameActive != wasGameActive)
+                    {
+                        if (isGameActive)
+                        {
+                            // Game just started
+                            ModLogger.LogInfo("Game started - starting kill logging");
+                            KillLogger.Instance.StartGameLogging();
+                        }
+                        else if (wasGameActive)
+                        {
+                            // Game just ended
+                            ModLogger.LogInfo("Game ended - stopping kill logging");
+                            KillLogger.Instance.StopGameLogging();
+                        }
+                        
+                        wasGameActive = isGameActive;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ModLogger.LogError($"Error monitoring game state: {ex.Message}");
+                }
+                
+                yield return new WaitForSeconds(1f);
+            }
         }
 
         private void UpdateUIForHostStatus() { }
@@ -441,6 +585,7 @@ namespace PlayerBanMod
         private System.Collections.IEnumerator LoadBannedPlayersAsync() { return banDataManager.LoadBansAsync(); }
 
         private void ProcessBanEntry(string entry) { }
-
     }
 }
+
+
